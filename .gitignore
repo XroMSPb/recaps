@@ -181,3 +181,11 @@ UpgradeLog*.htm
 
 # Microsoft Fakes
 FakesAssemblies/
+
+# Build output
+bin/
+obj/
+Output/
+ARM64/
+.vs/
+*.aps

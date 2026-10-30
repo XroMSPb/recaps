@@ -2,82 +2,487 @@
 #include "fixlayouts.h"
 #include "utils.h"
 
-#define HKL_HEBREW  (HKL)0x040D040D
-#define HKL_ENGLISH (HKL)0x04090409
+// Cast through ULONG_PTR so that these are well formed on 64-bit builds too
+#define HKL_HEBREW  ((HKL)(ULONG_PTR)0x040D040D)
+#define HKL_ENGLISH ((HKL)(ULONG_PTR)0x04090409)
+
+// Another application may well have the clipboard open - the clipboard
+// history, browsers and chat clients all watch it - so we give it a few tries
+#define CLIPBOARD_OPEN_ATTEMPTS 10
+#define CLIPBOARD_OPEN_WAIT     20
+
+// How long we wait for the active window to put the copied text on the
+// clipboard before giving up on it
+#define COPY_ATTEMPTS 10
+#define COPY_WAIT     30
+
+// The window that owns the clipboard while we work with it
+static HWND g_clipboardWindow = NULL;
+
+// Formats that ask the Windows 10 and 11 clipboard history and the cloud
+// clipboard to leave the data we put on the clipboard alone
+static UINT g_cfExcludeFromMonitor = 0;
+static UINT g_cfCanIncludeInHistory = 0;
+static UINT g_cfCanUploadToCloud = 0;
+
+///////////////////////////////////////////////////////////////////////////////
+// Remembers the window to open the clipboard with and registers the clipboard
+// formats we need
+void SetClipboardWindow(HWND hwnd)
+{
+	g_clipboardWindow = hwnd;
+	g_cfExcludeFromMonitor  = RegisterClipboardFormat(L"ExcludeClipboardContentFromMonitorProcessing");
+	g_cfCanIncludeInHistory = RegisterClipboardFormat(L"CanIncludeInClipboardHistory");
+	g_cfCanUploadToCloud    = RegisterClipboardFormat(L"CanUploadToCloudClipboard");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Opens the clipboard, retrying while another application holds it open.
+//
+// The window we pass in becomes the clipboard owner, and it must not be NULL:
+// EmptyClipboard sets the owner to NULL when the clipboard was opened without
+// a window, and SetClipboardData then fails.
+static BOOL OpenClipboardWithRetry()
+{
+	for (int i = 0; i < CLIPBOARD_OPEN_ATTEMPTS; i++)
+	{
+		if (OpenClipboard(g_clipboardWindow))
+			return TRUE;
+		Sleep(CLIPBOARD_OPEN_WAIT);
+	}
+
+	PrintDebugString("Could not open the clipboard, last error %lu", GetLastError());
+	return FALSE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Puts a single DWORD on the clipboard under `format`.
+// Must be called with the clipboard open.
+static void SetClipboardDword(UINT format, DWORD value)
+{
+	if (!format)
+		return;
+
+	HANDLE handle = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+	if (!handle)
+		return;
+
+	DWORD* data = (DWORD*)GlobalLock(handle);
+	if (!data)
+	{
+		GlobalFree(handle);
+		return;
+	}
+	*data = value;
+	GlobalUnlock(handle);
+
+	if (!SetClipboardData(format, handle))
+		GlobalFree(handle);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Keeps the text we are about to put on the clipboard out of the clipboard
+// history and out of the cloud clipboard: it is a temporary value of ours, not
+// something the user copied.
+// Must be called with the clipboard open.
+static void ExcludeFromClipboardHistory()
+{
+	SetClipboardDword(g_cfExcludeFromMonitor, 1);
+	SetClipboardDword(g_cfCanIncludeInHistory, 0);
+	SetClipboardDword(g_cfCanUploadToCloud, 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Puts unicode text on the clipboard
+BOOL SetClipboardText(const WCHAR* text)
+{
+	size_t size = sizeof(WCHAR) * (wcslen(text) + 1);
+	HANDLE handle = GlobalAlloc(GMEM_MOVEABLE, size);
+	if (!handle)
+		return FALSE;
+
+	WCHAR* clipboardText = (WCHAR*)GlobalLock(handle);
+	if (!clipboardText)
+	{
+		GlobalFree(handle);
+		return FALSE;
+	}
+	memcpy(clipboardText, text, size);
+	GlobalUnlock(handle);
+
+	if (!OpenClipboardWithRetry())
+	{
+		GlobalFree(handle);
+		return FALSE;
+	}
+
+	BOOL result = FALSE;
+	if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, handle))
+	{
+		// the clipboard owns the handle now
+		ExcludeFromClipboardHistory();
+		result = TRUE;
+	}
+	else
+	{
+		PrintDebugString("Could not put text on the clipboard, last error %lu", GetLastError());
+		GlobalFree(handle);
+	}
+
+	CloseClipboard();
+	return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Gets unicode text from the clipboard. 
+// You must free the returned string when you do not need it anymore.
+WCHAR* GetClipboardText()
+{
+	if (!IsClipboardFormatAvailable(CF_UNICODETEXT))
+		return NULL;
+
+	if (!OpenClipboardWithRetry())
+		return NULL;
+
+	WCHAR* text = NULL;
+	HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+	if (handle)
+	{
+		const WCHAR* clipboardText = (const WCHAR*)GlobalLock(handle);
+		if (clipboardText)
+		{
+			// GlobalSize is rounded up, so look for the terminator ourselves
+			// and never read past the end of the block
+			size_t maxLength = GlobalSize(handle) / sizeof(WCHAR);
+			size_t length = 0;
+			while (length < maxLength && clipboardText[length] != L'\0')
+				length++;
+
+			text = (WCHAR*)malloc(sizeof(WCHAR) * (length + 1));
+			if (text)
+			{
+				memcpy(text, clipboardText, sizeof(WCHAR) * length);
+				text[length] = L'\0';
+			}
+			GlobalUnlock(handle);
+		}
+	}
+
+	// always close the clipboard: leaving it open would stop every other
+	// application from copying anything
+	CloseClipboard();
+	return text;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Tells whether a clipboard format can be copied aside and put back later.
+//
+// Only formats whose data is a memory block can. The others are handles the
+// application that copied them owns (bitmaps, palettes, metafiles), or are
+// rendered on demand by that application, and duplicating the handle would
+// hand the clipboard something that is about to be freed.
+static BOOL IsRestorableClipboardFormat(UINT format)
+{
+	switch (format)
+	{
+	case CF_BITMAP:
+	case CF_DSPBITMAP:
+	case CF_PALETTE:
+	case CF_METAFILEPICT:
+	case CF_DSPMETAFILEPICT:
+	case CF_ENHMETAFILE:
+	case CF_DSPENHMETAFILE:
+	case CF_OWNERDISPLAY:
+		return FALSE;
+	default:
+		break;
+	}
+
+	if (format >= CF_PRIVATEFIRST && format <= CF_PRIVATELAST)
+		return FALSE;
+	if (format >= CF_GDIOBJFIRST && format <= CF_GDIOBJLAST)
+		return FALSE;
+
+	return TRUE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Stores the clipboard data in all the formats we can put back in `formats`.
+// You must call FreeClipboardData on `formats` when it is no longer needed.
+BOOL StoreClipboardData(ClipboardData* formats)
+{
+	ZeroMemory(formats, sizeof(*formats));
+
+	if (!OpenClipboardWithRetry())
+		return FALSE;
+
+	int maxFormats = CountClipboardFormats();
+	if (maxFormats <= 0)
+	{
+		// the clipboard is empty - there is nothing to remember, but putting
+		// it back later still means emptying it
+		CloseClipboard();
+		return TRUE;
+	}
+
+	formats->dataArray = (ClipboardFormat*)malloc(sizeof(ClipboardFormat) * maxFormats);
+	if (!formats->dataArray)
+	{
+		CloseClipboard();
+		return FALSE;
+	}
+	ZeroMemory(formats->dataArray, sizeof(ClipboardFormat) * maxFormats);
+
+	UINT format = EnumClipboardFormats(0);
+	while (format != 0 && formats->count < maxFormats)
+	{
+		if (IsRestorableClipboardFormat(format))
+		{
+			HANDLE dataHandle = GetClipboardData(format);
+			SIZE_T size = dataHandle ? GlobalSize(dataHandle) : 0;
+			const void* source = size ? GlobalLock(dataHandle) : NULL;
+			if (source)
+			{
+				HANDLE copy = GlobalAlloc(GMEM_MOVEABLE, size);
+				void* dest = copy ? GlobalLock(copy) : NULL;
+				if (dest)
+				{
+					CopyMemory(dest, source, size);
+					GlobalUnlock(copy);
+					formats->dataArray[formats->count].format = format;
+					formats->dataArray[formats->count].dataHandle = copy;
+					formats->count++;
+				}
+				else if (copy)
+				{
+					GlobalFree(copy);
+				}
+				GlobalUnlock(dataHandle);
+			}
+		}
+
+		// next format
+		format = EnumClipboardFormats(format);
+	}
+
+	CloseClipboard();
+	return TRUE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Restores the data in the clipboard from `formats` that was generated by
+// StoreClipboardData. Every handle the clipboard accepts becomes its property
+// and is dropped from `formats`.
+BOOL RestoreClipboardData(ClipboardData* formats)
+{
+	if (!OpenClipboardWithRetry())
+		return FALSE;
+
+	BOOL result = EmptyClipboard();
+	for (int i = 0; i < formats->count; i++)
+	{
+		if (!formats->dataArray[i].dataHandle)
+			continue;
+
+		if (SetClipboardData(formats->dataArray[i].format, formats->dataArray[i].dataHandle))
+			formats->dataArray[i].dataHandle = NULL;
+		else
+			result = FALSE;
+	}
+
+	CloseClipboard();
+	return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Frees `formats` allocated by StoreClipboardData, along with any handle the
+// clipboard did not take over
+void FreeClipboardData(ClipboardData* formats)
+{
+	if (formats->dataArray)
+	{
+		for (int i = 0; i < formats->count; i++)
+		{
+			if (formats->dataArray[i].dataHandle)
+				GlobalFree(formats->dataArray[i].dataHandle);
+		}
+		free(formats->dataArray);
+	}
+
+	ZeroMemory(formats, sizeof(*formats));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Asks UI Automation what the focused control has selected.
+//
+// This is what EM_GETSEL could never do: UI Automation reaches the control
+// through its accessibility interface, so it works across process boundaries
+// and in applications whose controls are not windows at all. When the focused
+// element does not implement the text pattern we say so and the caller falls
+// back to the clipboard.
+//
+// Returns TRUE when it could find out. *ppText is then the selected text, or
+// NULL when nothing is selected; free it with free().
+static BOOL GetSelectedTextFromFocus(WCHAR** ppText)
+{
+	*ppText = NULL;
+
+	IUIAutomation* automation = NULL;
+	HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
+		IID_IUIAutomation, (void**)&automation);
+	if (FAILED(hr) || automation == NULL)
+		return FALSE;
+
+	BOOL answered = FALSE;
+	IUIAutomationElement* focused = NULL;
+	if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused != NULL)
+	{
+		IUIAutomationTextPattern* textPattern = NULL;
+		if (SUCCEEDED(focused->GetCurrentPatternAs(UIA_TextPatternId,
+				IID_IUIAutomationTextPattern, (void**)&textPattern)) && textPattern != NULL)
+		{
+			IUIAutomationTextRangeArray* ranges = NULL;
+			if (SUCCEEDED(textPattern->GetSelection(&ranges)) && ranges != NULL)
+			{
+				int count = 0;
+				ranges->get_Length(&count);
+				answered = TRUE;
+
+				IUIAutomationTextRange* range = NULL;
+				if (count > 0 && SUCCEEDED(ranges->GetElement(0, &range)) && range != NULL)
+				{
+					BSTR selected = NULL;
+					if (SUCCEEDED(range->GetText(-1, &selected)) && selected != NULL)
+					{
+						UINT length = SysStringLen(selected);
+						if (length > 0)
+						{
+							size_t size = sizeof(WCHAR) * (length + 1);
+							*ppText = (WCHAR*)malloc(size);
+							if (*ppText)
+								memcpy(*ppText, selected, size);
+						}
+						SysFreeString(selected);
+					}
+					range->Release();
+				}
+				ranges->Release();
+			}
+			textPattern->Release();
+		}
+		focused->Release();
+	}
+
+	automation->Release();
+	return answered;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Puts `dummy` on the clipboard, asks the active window to copy its selection
+// over it and returns what we got, or NULL when nothing was copied.
+//
+// Comparing against a string we put there ourselves is how we find out whether
+// anything was selected at all. EM_GETSEL, which this used to ask the focused
+// control, cannot tell us: the pointers it writes through mean nothing in
+// another process.
+static WCHAR* CopySelectedText(const WCHAR* dummy)
+{
+	if (!SetClipboardText(dummy))
+		return NULL;
+
+	// copy the selected text by simulating Ctrl-C
+	SendKeyCombo(VK_CONTROL, 'C', FALSE);
+
+	for (int i = 0; i < COPY_ATTEMPTS; i++)
+	{
+		Sleep(COPY_WAIT);
+
+		WCHAR* text = GetClipboardText();
+		if (text && wcscmp(text, dummy) != 0)
+			return text;
+
+		free(text);
+	}
+
+	return NULL;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Converts the text in the active window from one keyboard layout to another
 // using the clipboard.
 void ConvertSelectedTextInActiveWindow(HKL hklSource, HKL hklTarget)
 {
-	WCHAR* sourceText = NULL;
-	WCHAR* targetText = NULL;
-	const WCHAR dummy [] = L"__RECAPS__";
+	const WCHAR dummy[] = L"__RECAPS__";
 
-	// store previous clipboard data and set clipboard to dummy string
+	// store previous clipboard data. if we cannot, we leave the clipboard
+	// alone rather than destroy what the user had on it.
 	ClipboardData prevClipboardData;
-	StoreClipboardData(&prevClipboardData);
-
-	SetClipboardText(dummy);
-
-	// copy the selected text by simulating Ctrl-C
-	SendKeyCombo(VK_CONTROL, 'C', FALSE);
-
-	// wait until copy operation completes and get the copied data from the clipboard
-	// this loop has the nice side effect of setting copyOK to FALSE if there's no
-	// selected text, since nothing is copied and the clipboard still contains the
-	// contents of `dummy`.
-	BOOL copyOK = FALSE;
-	for(int i = 0; i < 10; i++)
+	if (!StoreClipboardData(&prevClipboardData))
 	{
-		sourceText = GetClipboardText();
-		if (sourceText && wcscmp(sourceText, dummy) != 0)
+		PrintDebugString("Could not store the clipboard, giving up on the conversion");
+		return;
+	}
+
+	WCHAR* sourceText = NULL;
+
+	// Ask UI Automation first: it hands us the selected text without going
+	// near the clipboard, and it also tells us when nothing is selected,
+	// which is when the whole field has to be selected first.
+	BOOL selectionKnown = GetSelectedTextFromFocus(&sourceText);
+	if (selectionKnown && sourceText == NULL)
+	{
+		SendKeyCombo(VK_CONTROL, 'A', FALSE);
+		Sleep(REMOTE_APP_WAIT);
+		GetSelectedTextFromFocus(&sourceText);
+	}
+
+	if (sourceText == NULL)
+	{
+		// the application does not tell us, so go through the clipboard
+		sourceText = CopySelectedText(dummy);
+		if (!sourceText)
 		{
-			copyOK = TRUE;
-			break;
-		}
-		else
-		{
-			free(sourceText);
-			Sleep(30);
+			// nothing was selected: select the whole field and try again
+			SendKeyCombo(VK_CONTROL, 'A', FALSE);
+			sourceText = CopySelectedText(dummy);
 		}
 	}
 
-	if (copyOK)
+	if (sourceText)
 	{
-		// if the string only matches one particular layout, use it
-		// otherwise use the provided layout
-		int matches = 0;
-		HKL hklDetected = DetectLayoutFromString(sourceText, &matches);
-		if (matches == 1)
-			hklSource = hklDetected;
-
-		// convert the text between layouts
 		size_t length = wcslen(sourceText);
-		targetText = (WCHAR*)malloc(sizeof(WCHAR) * (length+1));
-		size_t converted = LayoutConvertString(sourceText, targetText, length+1, hklSource, hklTarget);
-
-		if (converted)
+		WCHAR* targetText = (WCHAR*)malloc(sizeof(WCHAR) * (length + 1));
+		if (targetText)
 		{
-			// put the converted string on the clipboard
-			if (SetClipboardText(targetText))
+			// if the string only matches one particular layout, use it
+			// otherwise use the provided layout
+			int matches = 0;
+			HKL hklDetected = DetectLayoutFromString(sourceText, &matches);
+			if (matches == 1)
+				hklSource = hklDetected;
+
+			// convert the text between layouts and put it on the clipboard
+			if (LayoutConvertString(sourceText, targetText, length + 1, hklSource, hklTarget) &&
+				SetClipboardText(targetText))
 			{
 				// simulate Ctrl-V to paste the text, replacing the previous text
 				SendKeyCombo(VK_CONTROL, 'V', FALSE);
 
-				// let the application complete pasting before putting the old data back on the clipboard
+				// let the application complete pasting before putting the old
+				// data back on the clipboard
 				Sleep(REMOTE_APP_WAIT);
 			}
+
+			free(targetText);
 		}
 
-		// restore the original clipboard data
-		RestoreClipboardData(&prevClipboardData);
-		FreeClipboardData(&prevClipboardData);
-
-		// free allocated memory
 		free(sourceText);
-		free(targetText);
 	}
+
+	// always restore the original clipboard data, even when nothing was
+	// converted: our dummy string must not be left on the clipboard
+	RestoreClipboardData(&prevClipboardData);
+	FreeClipboardData(&prevClipboardData);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -115,7 +520,7 @@ WCHAR LayoutConvertChar(WCHAR ch, HKL hklSource, HKL hklTarget)
 	BYTE shift = HIBYTE(vkAndShift);
 
 	// convert the shift state returned from VkKeyScanEx to an array that represents the
-	// key state usable with ToUnicodeEx that we'll be calling next
+	// key state usable with ToUnicodeEx that we will be calling next
 	BYTE keyState[256] = {0};
 	if (shift & 1) keyState[VK_SHIFT] = 0x80;	// turn on high bit
 	if (shift & 2) keyState[VK_CONTROL] = 0x80;
@@ -139,7 +544,8 @@ WCHAR LayoutConvertChar(WCHAR ch, HKL hklSource, HKL hklTarget)
 size_t LayoutConvertString(const WCHAR* str, WCHAR* buffer, size_t size, HKL hklSource, HKL hklTarget)
 {
 	size_t i;
-	for (i = 0; i < wcslen(str) && i < size-1; i++)
+	size_t length = wcslen(str);
+	for (i = 0; i < length && i < size-1; i++)
 	{
 		WCHAR ch = LayoutConvertChar(str[i], hklSource, hklTarget);
 		if (ch == 0)
@@ -153,23 +559,28 @@ size_t LayoutConvertString(const WCHAR* str, WCHAR* buffer, size_t size, HKL hkl
 ///////////////////////////////////////////////////////////////////////////////
 // Goes through all the installed keyboard layouts and returns a layout that
 // can generate the string. If not matching layout is found, returns NULL.
-// If `multiple` isn't NULL it will be set to the number of matched layouts.
+// If `pmatches` is not NULL it will be set to the number of matched layouts.
 HKL DetectLayoutFromString(const WCHAR* str, int* pmatches)
 {
 	HKL result = NULL;
-	HKL* hkls;
-	UINT layoutCount;
-	layoutCount = GetKeyboardLayoutList(0, NULL);
-	hkls = (HKL*)malloc(sizeof(HKL) * layoutCount);
-	GetKeyboardLayoutList(layoutCount, hkls);
+	UINT layoutCount = GetKeyboardLayoutList(0, NULL);
+	HKL* hkls = (HKL*)malloc(sizeof(HKL) * layoutCount);
+	if (!hkls)
+	{
+		if (pmatches)
+			*pmatches = 0;
+		return NULL;
+	}
+	layoutCount = GetKeyboardLayoutList(layoutCount, hkls);
 
 	int matches = 0;
-	for (size_t layout = 0; layout < layoutCount; layout++)
+	size_t length = wcslen(str);
+	for (UINT layout = 0; layout < layoutCount; layout++)
 	{
 		BOOL validLayout = TRUE;
-		for (size_t i = 0; i < wcslen(str); i++)
+		for (size_t i = 0; i < length; i++)
 		{
-			UINT vk = VkKeyScanEx(str[i], hkls[layout]);
+			SHORT vk = VkKeyScanEx(str[i], hkls[layout]);
 			if (vk == -1)
 			{
 				validLayout = FALSE;
@@ -184,6 +595,8 @@ HKL DetectLayoutFromString(const WCHAR* str, int* pmatches)
 		}
 	}
 
+	free(hkls);
+
 	if (pmatches)
 		*pmatches = matches;
 
@@ -191,121 +604,47 @@ HKL DetectLayoutFromString(const WCHAR* str, int* pmatches)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Stores the clipboard data in all its formats in `formats`.
-// You must call FreeAllClipboardData on `formats` when it's no longer needed.
-BOOL StoreClipboardData(ClipboardData* formats)
+// Fills in one keyboard event for SendInput.
+//
+// SendInput rather than keybd_event, which this used to call: keybd_event is
+// deprecated, and it sends no scan code, which applications that read the raw
+// input instead of the window messages ignore.
+static void FillKeyInput(INPUT* input, BYTE vk, BOOL extended, BOOL keyUp)
 {
-	if (OpenClipboard(NULL))
-	{
-		formats->count = CountClipboardFormats();
-		formats->dataArray = (ClipboardFormat*)malloc(sizeof(ClipboardData) * formats->count);
-		ZeroMemory(formats->dataArray, sizeof(ClipboardData) * formats->count); 
-		int i = 0;
-		UINT format = EnumClipboardFormats(0);
-		while (format)
-		{
-			HANDLE dataHandle = GetClipboardData(format);
-			LPVOID source = GlobalLock(dataHandle);
-			size_t size = GlobalSize(dataHandle);
-			formats->dataArray[i].format = format;
-			formats->dataArray[i].dataHandle = GlobalAlloc(GHND, size);
-			LPVOID dest = GlobalLock(formats->dataArray[i].dataHandle);
-			CopyMemory(dest, source, size);
-			GlobalUnlock(formats->dataArray[i].dataHandle);
-			GlobalUnlock(dataHandle);
-
-			// next format
-			format = EnumClipboardFormats(format);
-			i++;
-		}
-		CloseClipboard();
-		return TRUE;
-	}
-	return FALSE;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Restores the data in the clipboard from `formats` that was generated by
-// StoreClipboardData.
-BOOL RestoreClipboardData(const ClipboardData* formats)
-{
-	if (OpenClipboard(NULL))
-	{
-		EmptyClipboard();
-		for (int i = 0; i < formats->count; i++)
-		{
-			SetClipboardData(formats->dataArray[i].format, formats->dataArray[i].dataHandle);
-		}
-		CloseClipboard();
-		return TRUE;
-	}
-	return FALSE;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Frees `formats` allocated by StoreClipboardData
-void FreeClipboardData(ClipboardData* formats)
-{
-	free(formats->dataArray);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Gets unicode text from the clipboard. 
-// You must free the returned string when you don't need it anymore.
-WCHAR* GetClipboardText()
-{
-	WCHAR* text = NULL;
-	if (OpenClipboard(NULL))
-	{
-		HANDLE handle = GetClipboardData(CF_UNICODETEXT);
-		WCHAR* clipboardText = (WCHAR*)GlobalLock(handle);
-		if (!clipboardText) return NULL;
-		size_t size = sizeof(WCHAR) * (wcslen(clipboardText)+1);
-		text = (WCHAR*)malloc(size);
-		if (!text) return NULL;
-		memcpy(text, clipboardText, size);
-		CloseClipboard();
-	}
-	return text;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Puts unicode text on the clipboard
-BOOL SetClipboardText(const WCHAR* text)
-{
-	if (OpenClipboard(NULL))
-	{
-		size_t size = sizeof(WCHAR) * (wcslen(text)+1);
-		HANDLE handle = GlobalAlloc(GHND, size);
-		WCHAR* clipboardText = (WCHAR*)GlobalLock(handle);
-		memcpy(clipboardText, text, size);
-		GlobalUnlock(handle);
-		EmptyClipboard();
-		SetClipboardData(CF_UNICODETEXT, handle);
-		CloseClipboard();
-		return TRUE;
-	}
-	return FALSE;
+	ZeroMemory(input, sizeof(*input));
+	input->type = INPUT_KEYBOARD;
+	input->ki.wVk = vk;
+	input->ki.wScan = (WORD)MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+	input->ki.dwFlags = (extended ? KEYEVENTF_EXTENDEDKEY : 0) | (keyUp ? KEYEVENTF_KEYUP : 0);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Simulates a key press in the active window
-void SendKey(BYTE vk, BOOL extended)
+BOOL SendKey(BYTE vk, BOOL extended)
 {
-	keybd_event(vk, 0, extended ? KEYEVENTF_EXTENDEDKEY : 0, 0);
-	keybd_event(vk, 0, KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0), 0);
+	INPUT inputs[2];
+	FillKeyInput(&inputs[0], vk, extended, FALSE);
+	FillKeyInput(&inputs[1], vk, extended, TRUE);
+
+	return SendInput(2, inputs, sizeof(INPUT)) == 2;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Simulates a key combination (such as Ctrl+X) in the active window
-void SendKeyCombo(BYTE vkModifier, BYTE vk, BOOL extended)
+BOOL SendKeyCombo(BYTE vkModifier, BYTE vk, BOOL extended)
 {
-	BOOL modPressed = (GetKeyState(vkModifier) & 0x80000000) > 0;
-	if (!modPressed)
-		keybd_event(vkModifier, 0, 0, 0);
-	keybd_event(vk, 0, extended ? KEYEVENTF_EXTENDEDKEY : 0, 0);
-	if (!modPressed)
-		keybd_event(vkModifier, 0, KEYEVENTF_KEYUP, 0);
-	keybd_event(vk, 0, KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0), 0);
-}
+	// Leave the modifier alone when the user is already holding it down, which
+	// is the usual case here: the shortcut that got us going contains it.
+	BOOL modPressed = (GetAsyncKeyState(vkModifier) & 0x8000) != 0;
 
+	INPUT inputs[4];
+	UINT count = 0;
+	if (!modPressed)
+		FillKeyInput(&inputs[count++], vkModifier, FALSE, FALSE);
+	FillKeyInput(&inputs[count++], vk, extended, FALSE);
+	FillKeyInput(&inputs[count++], vk, extended, TRUE);
+	if (!modPressed)
+		FillKeyInput(&inputs[count++], vkModifier, FALSE, TRUE);
+
+	return SendInput(count, inputs, sizeof(INPUT)) == count;
+}

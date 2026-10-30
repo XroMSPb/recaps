@@ -24,8 +24,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "stdafx.h"
 #include "resource.h"
+#include "version.h"
 #include "trayicon.h"
 #include "fixlayouts.h"
+#include "utils.h"
 
 #define HELP_MESSAGE \
     L"Recaps allows you to quickly switch the current\r\n"\
@@ -42,21 +44,23 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
     L"Eli Golovinsky, Israel 2008\r\n"
 
 #define HELP_TITLE \
-    L"Recaps 0.8 - Retake your Capslock!"
+    L"Recaps " RECAPS_VERSION_STRW L" - Retake your Capslock!"
 
 // Tray icon constants
 #define ID_TRAYICON          1
-#define APPWM_TRAYICON       WM_APP
-#define APPWM_NOP            WM_APP + 1
+#define APPWM_TRAYICON       (WM_APP + 0)
+#define APPWM_NOP            (WM_APP + 1)
+
+// Work the keyboard hook asks us to do. The hook procedure itself must return
+// as quickly as it can (see LowLevelHookProc), so all it does is post these.
+#define APPWM_SWITCH_LAYOUT      (WM_APP + 2)
+#define APPWM_SWITCH_AND_CONVERT (WM_APP + 3)
+#define APPWM_SWITCH_TO_NUMBER   (WM_APP + 4)
 
 //  Our commands
 #define ID_ABOUT             2000
 #define ID_EXIT              2001
 #define ID_LANG              2002
-
-// Hook stuff
-#define WH_KEYBOARD_LL 13
-#define LLKHF_INJECTED 0x10
 
 // General constants
 #define MAXLEN 1024
@@ -65,8 +69,21 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define WINDOWCLASS_NAME L"RECAPS"
 #define TITLE L"Recaps"
 
+#define CONFIG_KEY           L"Software\\Recaps"
+#define KEYBOARD_LAYOUTS_KEY L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts"
+
+// How often we look at the active window to see which language it is using
+#define IDT_LAYOUT_POLL      2
+#define LAYOUT_POLL_PERIOD   500
+#define THEME_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+
+// How often we make sure our keyboard hook is still installed
+#define IDT_HOOK_WATCHDOG    1
+#define HOOK_WATCHDOG_PERIOD 10000
+
 struct KeyboardLayoutInfo {
     WCHAR names[MAX_LAYOUTS][MAXLEN];
+    WCHAR klids[MAX_LAYOUTS][KL_NAMELENGTH];
     HKL   hkls[MAX_LAYOUTS];
     UINT  menuIds[MAX_LAYOUTS];
     BOOL  inUse[MAX_LAYOUTS];
@@ -77,70 +94,168 @@ struct KeyboardLayoutInfo {
 KeyboardLayoutInfo g_keyboardInfo = {0};
 BOOL g_modalShown = FALSE;
 HHOOK g_hHook = NULL;
+HWND g_hMessageWindow = NULL;
+
+// Explorer broadcasts this message when the taskbar is created, which is when
+// we have to put our tray icon back.
+UINT g_uTaskbarCreated = 0;
+
+// Set while a conversion is in progress, so that two of them never fight over
+// the clipboard.
+volatile LONG g_converting = 0;
+
+// The layout the tray icon is currently showing
+HKL g_shownLayout = NULL;
+
+// What GetLastInputInfo reported the last time the watchdog looked
+DWORD g_lastCheckedInput = 0;
 
 // Prototypes
-void ShowError(const WCHAR* message);
-void PrintDebugString(const char* format, ...);
-
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 int OnTrayIcon(HWND hWnd, WPARAM wParam, LPARAM lParam);
 int OnCommand(HWND hWnd, WORD wID, HWND hCtl);
 BOOL ShowPopupMenu(HWND hWnd);
 
-void GetKeyboardLayouts(KeyboardLayoutInfo* info);
+void RefreshKeyboardLayouts(KeyboardLayoutInfo* info);
+void RefreshKeyboardLayoutsIfChanged(KeyboardLayoutInfo* info);
 void LoadConfiguration(KeyboardLayoutInfo* info);
 void SaveConfiguration(const KeyboardLayoutInfo* info);
 
 HWND RemoteGetFocus();
 HKL SwitchLayout();
+void SwitchToLayoutNumber(int number);
+void UpdateTrayIcon(BOOL force);
+void StartSwitchAndConvert();
+BOOL InstallHook();
+void CheckHook();
 LRESULT CALLBACK LowLevelHookProc(int nCode, WPARAM wParam, LPARAM lParam);
+
+///////////////////////////////////////////////////////////////////////////////
+// Fills `path` with the executable of the Recaps instance that is already
+// running, so that we can name it instead of leaving the user guessing which
+// copy holds the mutex - an older build left running in the notification area
+// takes the same name as this one. Best effort: the message makes sense
+// without it too.
+static BOOL GetRunningInstancePath(WCHAR* path, DWORD size) {
+    HWND existing = FindWindow(WINDOWCLASS_NAME, NULL);
+    if (existing == NULL) {
+        return FALSE;
+    }
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(existing, &processId);
+    if (processId == 0) {
+        return FALSE;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == NULL) {
+        return FALSE;
+    }
+
+    BOOL result = QueryFullProcessImageName(process, 0, path, &size);
+    CloseHandle(process);
+    return result;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Program's entry point
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    UNREFERENCED_PARAMETER(hInstance);
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
 
-    // Prevent from two copies of Recaps from running at the same time
-    HANDLE mutex = CreateMutex(NULL, FALSE, MUTEX);
-    DWORD result = WaitForSingleObject(mutex, 0);
-    if (result == WAIT_TIMEOUT) {
-        MessageBox(NULL, L"Recaps is already running.", L"Recaps", MB_OK | MB_ICONINFORMATION);
+    // Prevent from two copies of Recaps from running at the same time.
+    // CreateMutex only sets ERROR_ALREADY_EXISTS when the mutex was there
+    // before us, so clear the last error first and nothing that ran before
+    // us can be mistaken for a second copy.
+    SetLastError(ERROR_SUCCESS);
+    HANDLE mutex = CreateMutex(NULL, TRUE, MUTEX);
+    if (mutex == NULL) {
+        ShowError(L"Recaps could not create its mutex.");
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        WCHAR message[MAXLEN];
+        WCHAR path[MAX_PATH] = {0};
+        if (GetRunningInstancePath(path, _countof(path))) {
+            swprintf_s(message, _countof(message),
+                L"Recaps is already running.\n\nThe copy that is running is:\n%s"
+                L"\n\nIts icon is in the notification area - right click it for its menu.",
+                path);
+        } else {
+            wcscpy_s(message, _countof(message),
+                L"Recaps is already running.\n\n"
+                L"Its icon is in the notification area - right click it for its menu.");
+        }
+        MessageBox(NULL, message, TITLE, MB_OK | MB_ICONINFORMATION);
+        CloseHandle(mutex);
         return 1;
     }
 
-    // Create a fake window to listen to events
+    // TSF and UI Automation are COM. This thread pumps messages, so it is an
+    // apartment; the conversion thread sets itself up separately.
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    // Create a hidden window to listen to events. It has to be a top level
+    // window rather than a message-only one: broadcast messages, and the
+    // TaskbarCreated message we need in particular, are never delivered to
+    // message-only windows.
     WNDCLASSEX wclx = {0};
     wclx.cbSize         = sizeof( wclx );
     wclx.lpfnWndProc    = &WindowProc;
     wclx.hInstance      = hInstance;
     wclx.lpszClassName  = WINDOWCLASS_NAME;
     RegisterClassEx(&wclx);
-    HWND hMessageWindow = CreateWindow(WINDOWCLASS_NAME, 0, 0, 0, 0, 0, 0, HWND_MESSAGE, 0, hInstance, 0);
+    g_hMessageWindow = CreateWindowEx(WS_EX_TOOLWINDOW, WINDOWCLASS_NAME, TITLE,
+        WS_POPUP, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    if (g_hMessageWindow == NULL) {
+        ShowError(L"Recaps could not create its window.");
+        CloseHandle(mutex);
+        return 1;
+    }
 
-    // Set hook to capture CapsLock
-    g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelHookProc, GetModuleHandle(NULL), 0);
+    g_uTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
 
     // Initialize
-    AddTrayIcon(hMessageWindow, 0, APPWM_TRAYICON, IDI_MAINFRAME, TITLE);
-    GetKeyboardLayouts(&g_keyboardInfo);
-    LoadConfiguration(&g_keyboardInfo);
+    SetClipboardWindow(g_hMessageWindow);
+    AddTrayIcon(g_hMessageWindow, ID_TRAYICON, APPWM_TRAYICON, IDI_MAINFRAME, TITLE);
+    RefreshKeyboardLayouts(&g_keyboardInfo);
+    UpdateTrayIcon(TRUE);
+
+    // Set hook to capture CapsLock
+    if (!InstallHook()) {
+        ShowError(L"Recaps could not install its keyboard hook.");
+    }
+    SetTimer(g_hMessageWindow, IDT_HOOK_WATCHDOG, HOOK_WATCHDOG_PERIOD, NULL);
+    SetTimer(g_hMessageWindow, IDT_LAYOUT_POLL, LAYOUT_POLL_PERIOD, NULL);
 
     // Handle messages
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    BOOL result;
+    while ((result = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (result == -1) {
+            break; // the queue is broken, there is nothing left to wait for
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
     // Clean up
-    RemoveTrayIcon(hMessageWindow, 0);
-    UnregisterClass(WINDOWCLASS_NAME, hInstance);
-    DestroyWindow(hMessageWindow);
+    KillTimer(g_hMessageWindow, IDT_HOOK_WATCHDOG);
+    KillTimer(g_hMessageWindow, IDT_LAYOUT_POLL);
+    if (g_hHook != NULL) {
+        UnhookWindowsHookEx(g_hHook);
+        g_hHook = NULL;
+    }
     SaveConfiguration(&g_keyboardInfo);
-    UnhookWindowsHookEx(g_hHook);
+    RemoveTrayIcon(g_hMessageWindow, ID_TRAYICON);
+    DestroyWindow(g_hMessageWindow);
+    g_hMessageWindow = NULL;
+    UnregisterClass(WINDOWCLASS_NAME, hInstance);
+    CoUninitialize();
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
 
     return 0;
 }
@@ -148,9 +263,53 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 ///////////////////////////////////////////////////////////////////////////////
 // Handles events at the window (both hot key and from the tray icon)
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Explorer was restarted and took our tray icon with it
+    if (uMsg == g_uTaskbarCreated && g_uTaskbarCreated != 0) {
+        AddTrayIcon(hWnd, ID_TRAYICON, APPWM_TRAYICON, IDI_MAINFRAME, TITLE);
+        UpdateTrayIcon(TRUE);
+        return 0;
+    }
+
     switch (uMsg) {
     case APPWM_TRAYICON:
         return OnTrayIcon(hWnd, wParam, lParam);
+
+    // The messages the keyboard hook posts. Doing this work here instead of in
+    // the hook procedure keeps the hook fast enough for Windows not to drop it,
+    // and lets it talk to a foreground window that may be busy.
+    case APPWM_SWITCH_LAYOUT:
+        RefreshKeyboardLayoutsIfChanged(&g_keyboardInfo);
+        SwitchLayout();
+        return 0;
+
+    case APPWM_SWITCH_AND_CONVERT:
+        RefreshKeyboardLayoutsIfChanged(&g_keyboardInfo);
+        StartSwitchAndConvert();
+        return 0;
+
+    case APPWM_SWITCH_TO_NUMBER:
+        RefreshKeyboardLayoutsIfChanged(&g_keyboardInfo);
+        SwitchToLayoutNumber((int)wParam);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == IDT_HOOK_WATCHDOG) {
+            CheckHook();
+            return 0;
+        }
+        if (wParam == IDT_LAYOUT_POLL) {
+            UpdateTrayIcon(FALSE);
+            return 0;
+        }
+        break;
+
+    // The user added, removed or renamed a keyboard layout
+    case WM_SETTINGCHANGE:
+    case WM_INPUTLANGCHANGE:
+        RefreshKeyboardLayouts(&g_keyboardInfo);
+        // the taskbar may have gone from light to dark as well
+        UpdateTrayIcon(TRUE);
+        return 0;
 
     case WM_COMMAND:
         return OnCommand(hWnd, LOWORD(wParam), (HWND)lParam);
@@ -160,8 +319,10 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     default:
-        return DefWindowProc(hWnd, uMsg, wParam, lParam);
+        break;
     }
+
+    return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -209,6 +370,9 @@ int OnCommand(HWND hWnd, WORD wID, HWND hCtl) {
 // Create and display a popup menu when the user right-clicks on the icon
 BOOL ShowPopupMenu(HWND hWnd) {
     int i = 0;
+
+    RefreshKeyboardLayoutsIfChanged(&g_keyboardInfo);
+
     // Create the menu
     HMENU hPop = CreatePopupMenu();
     InsertMenu(hPop, i++, MF_BYPOSITION | MF_STRING, ID_ABOUT, L"About");
@@ -253,34 +417,188 @@ BOOL ShowPopupMenu(HWND hWnd) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Fills ``info`` with the currently installed keyboard layouts
-// Based on http://blogs.msdn.com/michkap/archive/2004/12/05/275231.aspx.
-void GetKeyboardLayouts(KeyboardLayoutInfo* info) {
-    memset(info, 0 ,sizeof(KeyboardLayoutInfo));
-    info->count = GetKeyboardLayoutList(MAX_LAYOUTS, info->hkls);
+// Finds the KLID - the eight hex digit name a keyboard layout goes by in the
+// registry, such as "00010419" - of the layout with the given "Layout Id".
+static BOOL FindKlidByLayoutId(WORD layoutId, WCHAR* klid, size_t size) {
+    HKEY hLayouts;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, KEYBOARD_LAYOUTS_KEY, 0, KEY_READ, &hLayouts) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    BOOL found = FALSE;
+    for (DWORD index = 0; !found; index++) {
+        WCHAR subKeyName[64];
+        DWORD subKeyLength = _countof(subKeyName);
+        if (RegEnumKeyEx(hLayouts, index, subKeyName, &subKeyLength, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            break;
+        }
+
+        HKEY hLayout;
+        if (RegOpenKeyEx(hLayouts, subKeyName, 0, KEY_READ, &hLayout) != ERROR_SUCCESS) {
+            continue;
+        }
+
+        WCHAR value[16] = {0};
+        DWORD type = 0;
+        DWORD length = sizeof(value) - sizeof(WCHAR);
+        if (RegQueryValueEx(hLayout, L"Layout Id", NULL, &type, (BYTE*)value, &length) == ERROR_SUCCESS &&
+            type == REG_SZ &&
+            (WORD)wcstoul(value, NULL, 16) == layoutId) {
+            found = wcscpy_s(klid, size, subKeyName) == 0;
+        }
+        RegCloseKey(hLayout);
+    }
+
+    RegCloseKey(hLayouts);
+    return found;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Builds the KLID of an HKL.
+//
+// The low word of an HKL is the language id. The high word identifies the
+// keyboard layout: zero for the default layout of that language, a small
+// number for one of the layouts that ship with Windows, and 0xFxxx for a
+// layout that is only identified by a "Layout Id" value in the registry.
+static void HklToKlid(HKL hkl, WCHAR* klid, size_t size) {
+    WORD language = LOWORD((ULONG_PTR)hkl);
+    WORD layout = HIWORD((ULONG_PTR)hkl);
+
+    if ((layout & 0xF000) == 0xF000 && FindKlidByLayoutId((WORD)(layout & 0x0FFF), klid, size)) {
+        return;
+    }
+
+    if (swprintf_s(klid, size, L"%04X%04X", layout, language) < 0) {
+        klid[0] = L'\0';
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Reads the name a keyboard layout has of its own, such as
+// "Russian - Typewriter", from the registry.
+static BOOL GetLayoutText(const WCHAR* klid, WCHAR* text, size_t size) {
+    if (klid[0] == L'\0') {
+        return FALSE;
+    }
+
+    WCHAR keyName[MAXLEN];
+    if (swprintf_s(keyName, MAXLEN, L"%s\\%s", KEYBOARD_LAYOUTS_KEY, klid) < 0) {
+        return FALSE;
+    }
+
+    HKEY hkey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, keyName, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    // Zero the buffer and leave room for a terminator: RegQueryValueEx does not
+    // promise that the string it hands back is terminated.
+    ZeroMemory(text, size * sizeof(WCHAR));
+    DWORD type = 0;
+    DWORD length = (DWORD)((size - 1) * sizeof(WCHAR));
+    BOOL result = RegQueryValueEx(hkey, L"Layout Text", NULL, &type, (BYTE*)text, &length) == ERROR_SUCCESS &&
+                  type == REG_SZ && text[0] != L'\0';
+    RegCloseKey(hkey);
+
+    return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Fills in the names we show in the menu. Two layouts of the same language -
+// "Russian" and "Russian - Typewriter", say - share one language name, so the
+// name of the layout itself is appended whenever a language has more than one
+// layout installed and the entries would be indistinguishable otherwise.
+static void BuildLayoutNames(KeyboardLayoutInfo* info) {
     for (UINT i = 0; i < info->count; i++) {
-        LANGID language = (LANGID)(((UINT)info->hkls[i]) & 0x0000FFFF); // bottom 16 bit of HKL
+        WORD language = LOWORD((ULONG_PTR)info->hkls[i]);
         LCID locale = MAKELCID(language, SORT_DEFAULT);
-        GetLocaleInfo(locale, LOCALE_SLANGUAGE, info->names[i], MAXLEN);
+        if (GetLocaleInfo(locale, LOCALE_SLANGUAGE, info->names[i], MAXLEN) == 0) {
+            swprintf_s(info->names[i], MAXLEN, L"%s", info->klids[i]);
+        }
+
+        BOOL ambiguous = FALSE;
+        for (UINT j = 0; j < info->count; j++) {
+            if (j != i && LOWORD((ULONG_PTR)info->hkls[j]) == language) {
+                ambiguous = TRUE;
+                break;
+            }
+        }
+        if (!ambiguous) {
+            continue;
+        }
+
+        WCHAR layoutText[MAXLEN];
+        if (GetLayoutText(info->klids[i], layoutText, MAXLEN)) {
+            WCHAR combined[MAXLEN];
+            if (swprintf_s(combined, MAXLEN, L"%s (%s)", info->names[i], layoutText) > 0) {
+                wcscpy_s(info->names[i], MAXLEN, combined);
+            }
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Fills ``info`` with the currently installed keyboard layouts and with the
+// configuration saved for them.
+// Based on http://blogs.msdn.com/michkap/archive/2004/12/05/275231.aspx.
+void RefreshKeyboardLayouts(KeyboardLayoutInfo* info) {
+    UINT current = info->current;
+
+    memset(info, 0, sizeof(KeyboardLayoutInfo));
+    info->current = current;
+    info->count = GetKeyboardLayoutList(MAX_LAYOUTS, info->hkls);
+
+    for (UINT i = 0; i < info->count; i++) {
+        HklToKlid(info->hkls[i], info->klids[i], KL_NAMELENGTH);
         info->inUse[i] = TRUE;
     }
+
+    BuildLayoutNames(info);
+    LoadConfiguration(info);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Re-reads the installed keyboard layouts if the user added or removed one
+// since we last looked. Windows has no notification for this that we can rely
+// on, and the list is cheap to ask for, so we just compare it with ours.
+void RefreshKeyboardLayoutsIfChanged(KeyboardLayoutInfo* info) {
+    HKL hkls[MAX_LAYOUTS] = {0};
+    UINT count = GetKeyboardLayoutList(MAX_LAYOUTS, hkls);
+
+    if (count == info->count && memcmp(hkls, info->hkls, count * sizeof(HKL)) == 0) {
+        return;
+    }
+
+    PrintDebugString("The installed keyboard layouts changed, re-reading them");
+    RefreshKeyboardLayouts(info);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Load currently active keyboard layouts from the registry
 void LoadConfiguration(KeyboardLayoutInfo* info) {
     HKEY hkey;
-    LONG result = RegOpenKey(HKEY_CURRENT_USER, L"Software\\Recaps", &hkey);
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, CONFIG_KEY, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+        return;
+    }
 
     // Load current isUse value for each language
-    if (result == ERROR_SUCCESS) {
-        for (UINT i = 0; i < info->count; i++) {
-            DWORD data = 0;
-            DWORD length = sizeof(DWORD);
-            result = RegQueryValueEx(hkey, info->names[i], 0, NULL, (BYTE*)(&data), &length);
-            if (result == ERROR_SUCCESS) {
-                info->inUse[i] = (BOOL)data;
-            }
+    for (UINT i = 0; i < info->count; i++) {
+        DWORD data = 0;
+        DWORD type = 0;
+        DWORD length = sizeof(data);
+        LONG result = RegQueryValueEx(hkey, info->klids[i], 0, &type, (BYTE*)(&data), &length);
+        if (result != ERROR_SUCCESS || type != REG_DWORD) {
+            // Settings used to be keyed by the localized name of the language,
+            // which changed along with the Windows display language and could
+            // not tell two layouts of one language apart. Fall back to the old
+            // name so that a configuration written by an earlier version of
+            // Recaps still counts.
+            type = 0;
+            length = sizeof(data);
+            result = RegQueryValueEx(hkey, info->names[i], 0, &type, (BYTE*)(&data), &length);
+        }
+        if (result == ERROR_SUCCESS && type == REG_DWORD) {
+            info->inUse[i] = (data != 0);
         }
     }
 
@@ -291,32 +609,42 @@ void LoadConfiguration(KeyboardLayoutInfo* info) {
 // Saves currently active keyboard layouts to the registry
 void SaveConfiguration(const KeyboardLayoutInfo* info) {
     HKEY hkey;
-    LONG result = RegOpenKey(HKEY_CURRENT_USER, L"Software\\Recaps", &hkey);
-    if (result != ERROR_SUCCESS) {
-        result = RegCreateKey(HKEY_CURRENT_USER, L"Software\\Recaps", &hkey);
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, CONFIG_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hkey, NULL) != ERROR_SUCCESS) {
+        return;
     }
 
     // Save current isUse value for each language
-    if (result == ERROR_SUCCESS) {
-        for (UINT i = 0; i < info->count; i++) {
-            DWORD data = info->inUse[i];
-            RegSetValueEx(hkey, info->names[i], 0, REG_DWORD, (CONST BYTE*)(&data), sizeof(DWORD));
+    for (UINT i = 0; i < info->count; i++) {
+        if (info->klids[i][0] == L'\0') {
+            continue;
         }
+        DWORD data = info->inUse[i] ? 1 : 0;
+        RegSetValueEx(hkey, info->klids[i], 0, REG_DWORD, (CONST BYTE*)(&data), sizeof(DWORD));
     }
 
     RegCloseKey(hkey);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Finds out which window has the focus
+// Finds out which window has the focus.
+//
+// GUITHREADINFO rather than AttachThreadInput, which this used to use:
+// attaching our input queue to the queue of another process blocks while that
+// process is busy and affects how focus behaves in both of them.
 HWND RemoteGetFocus() {
-    HWND hwnd = GetForegroundWindow();
-    DWORD remoteThreadId = GetWindowThreadProcessId(hwnd, NULL);
-    DWORD currentThreadId = GetCurrentThreadId();
-    AttachThreadInput(remoteThreadId, currentThreadId, TRUE);
-    HWND focused = GetFocus();
-    AttachThreadInput(remoteThreadId, currentThreadId, FALSE);
-    return focused;
+    HWND foreground = GetForegroundWindow();
+    if (foreground == NULL) {
+        return NULL;
+    }
+
+    GUITHREADINFO gui = {0};
+    gui.cbSize = sizeof(gui);
+    DWORD threadId = GetWindowThreadProcessId(foreground, NULL);
+    if (GetGUIThreadInfo(threadId, &gui) && gui.hwndFocus != NULL) {
+        return gui.hwndFocus;
+    }
+
+    return foreground;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -328,20 +656,133 @@ HKL GetCurrentLayout() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Picks the colour to draw the language with: white on the dark taskbar, black
+// on the light one.
+static COLORREF GetTrayTextColor() {
+    DWORD lightTheme = 0;
+    DWORD type = 0;
+    DWORD length = sizeof(lightTheme);
+
+    HKEY hkey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, THEME_KEY, 0, KEY_READ, &hkey) == ERROR_SUCCESS) {
+        if (RegQueryValueEx(hkey, L"SystemUsesLightTheme", NULL, &type, (BYTE*)(&lightTheme), &length) != ERROR_SUCCESS ||
+            type != REG_DWORD) {
+            lightTheme = 0;
+        }
+        RegCloseKey(hkey);
+    }
+
+    return lightTheme ? RGB(0, 0, 0) : RGB(255, 255, 255);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Shows the language of the active window on the tray icon, so that the icon
+// says something rather than being a logo that never changes.
+//
+// This runs on a timer because the layout also changes without us - with
+// Win+Space, or from the language bar - and there is no notification we could
+// subscribe to for another window.
+void UpdateTrayIcon(BOOL force) {
+    HKL layout = GetCurrentLayout();
+    if (layout == NULL || (!force && layout == g_shownLayout)) {
+        return;
+    }
+    g_shownLayout = layout;
+
+    LANGID language = LOWORD((ULONG_PTR)layout);
+    LCID locale = MAKELCID(language, SORT_DEFAULT);
+
+    WCHAR abbreviation[16];
+    if (GetLocaleInfo(locale, LOCALE_SISO639LANGNAME, abbreviation, _countof(abbreviation)) == 0) {
+        wcscpy_s(abbreviation, _countof(abbreviation), L"?");
+    }
+    CharUpperBuff(abbreviation, (DWORD)wcslen(abbreviation));
+
+    // the full name of the layout goes into the tooltip
+    WCHAR tooltip[128];
+    const WCHAR* name = NULL;
+    for (UINT i = 0; i < g_keyboardInfo.count; i++) {
+        if (g_keyboardInfo.hkls[i] == layout) {
+            name = g_keyboardInfo.names[i];
+            break;
+        }
+    }
+    if (name != NULL) {
+        _snwprintf_s(tooltip, _countof(tooltip), _TRUNCATE, L"Recaps - %s", name);
+    } else {
+        wcscpy_s(tooltip, _countof(tooltip), TITLE);
+    }
+
+    SetTrayIconText(g_hMessageWindow, ID_TRAYICON, abbreviation, GetTrayTextColor(), tooltip);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Switches the input of the whole desktop to `hkl` through the Text Services
+// Framework.
+//
+// WM_INPUTLANGCHANGEREQUEST only reaches windows that run a classic message
+// loop, so it does nothing in UWP and WinUI applications - Settings, the Store,
+// anything built on XAML - while TSF is how Windows itself switches the input
+// profile. The profile is activated for the whole desktop, which is what
+// Windows 10 and 11 do by default: one input language for everything rather
+// than one per window.
+static BOOL ActivateLayoutViaTsf(HKL hkl) {
+    ITfInputProcessorProfileMgr* profileMgr = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
+        IID_ITfInputProcessorProfileMgr, (void**)&profileMgr);
+    if (FAILED(hr) || profileMgr == NULL) {
+        return FALSE;
+    }
+
+    LANGID language = LOWORD((ULONG_PTR)hkl);
+    hr = profileMgr->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT, language,
+        CLSID_NULL, GUID_NULL, hkl, TF_IPPMF_FORSESSION);
+    if (FAILED(hr)) {
+        // Without this flag the call is documented to fail when the language
+        // being asked for is not the one that is currently active, which is
+        // exactly the case every time we switch.
+        hr = profileMgr->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT, language,
+            CLSID_NULL, GUID_NULL, hkl,
+            TF_IPPMF_FORSESSION | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE);
+    }
+    profileMgr->Release();
+
+    if (FAILED(hr)) {
+        PrintDebugString("ActivateProfile failed with 0x%08lX", hr);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Activates the selected language
 HKL ChangeInputLanguage(UINT newLanguage) {
     HWND hwnd = RemoteGetFocus();
+    if (hwnd == NULL) {
+        return NULL;
+    }
+
     g_keyboardInfo.current = newLanguage;
-    PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)(g_keyboardInfo.hkls[g_keyboardInfo.current]));
+    HKL hkl = g_keyboardInfo.hkls[g_keyboardInfo.current];
+
+    // Ask through TSF first, which is what reaches modern applications, and
+    // post the message as well for the windows that only understand that.
+    // Both ask for the same layout, so asking twice costs nothing.
+    ActivateLayoutViaTsf(hkl);
+    PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
 #ifdef _DEBUG
     PrintDebugString("Language set to %S", g_keyboardInfo.names[g_keyboardInfo.current]);
 #endif
-    return g_keyboardInfo.hkls[g_keyboardInfo.current];
+    return hkl;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Switches the current language
 HKL SwitchLayout() {
+    if (g_keyboardInfo.count == 0) {
+        return NULL;
+    }
+
     HKL currentLayout = GetCurrentLayout();
 
     // Find the current keyboard layout's index
@@ -372,7 +813,7 @@ HKL SwitchLayout() {
 void SwitchToLayoutNumber(int number) {
     HKL currentLayout = GetCurrentLayout();
     BOOL found = FALSE;
-    UINT languageIndex;
+    UINT languageIndex = 0;
     for (UINT i = 0; i < g_keyboardInfo.count; i++) {
         if (!g_keyboardInfo.inUse[i]) {
             continue;
@@ -394,29 +835,93 @@ void SwitchToLayoutNumber(int number) {
 ///////////////////////////////////////////////////////////////////////////////
 // Converts current selection or the entire text to the current keyboard layout
 void SwitchAndConvert(void*) {
-    DWORD start, end;
-    start = end = 0;
-    SendMessage(RemoteGetFocus(), EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-    // start == 2815948, end == 258 when in address bar of Chrome
-    // start == 3666796, end == 258 when in address bar of Firefox
+    // This thread has no message loop, so it joins the multi threaded
+    // apartment, which is what UI Automation wants from a client anyway.
+    HRESULT comInitialized = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-#ifdef _DEBUG
-    PrintDebugString("Selection from %d to %d", start, end);
-#endif
-
-    if (start >= end) {
-        // If no text selected
-        SendKeyCombo(VK_CONTROL, 'A', TRUE);
-    }
     HKL sourceLayout = GetCurrentLayout();
     HKL targetLayout = SwitchLayout();
-    ConvertSelectedTextInActiveWindow(sourceLayout, targetLayout);
+    if (targetLayout != NULL) {
+        ConvertSelectedTextInActiveWindow(sourceLayout, targetLayout);
+    }
+
+    if (SUCCEEDED(comInitialized)) {
+        CoUninitialize();
+    }
+    InterlockedExchange(&g_converting, 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Starts a conversion in another thread, since it simulates the keystrokes
+// that copy and paste the text and has to wait for the other application to
+// react to them. Only one conversion runs at a time: two of them would fight
+// over the clipboard.
+void StartSwitchAndConvert() {
+    if (InterlockedCompareExchange(&g_converting, 1, 0) != 0) {
+        return;
+    }
+    if (_beginthread(SwitchAndConvert, 0, NULL) == (uintptr_t)(-1)) {
+        InterlockedExchange(&g_converting, 0);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Installs the low level keyboard hook
+BOOL InstallHook() {
+    if (g_hHook != NULL) {
+        return TRUE;
+    }
+
+    g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelHookProc, GetModuleHandle(NULL), 0);
+    if (g_hHook == NULL) {
+        PrintDebugString("SetWindowsHookEx failed with error %lu", GetLastError());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Makes sure our keyboard hook is still there.
+//
+// Windows removes a low level keyboard hook whose procedure takes longer than
+// LowLevelHooksTimeout to return and tells nobody about it, and there is no API
+// to ask whether a hook is still installed. So we put it back from time to
+// time: a hook that is still alive only moves to the front of the hook chain,
+// and no keystroke is lost, since the new hook is in place before the old one
+// is removed. We skip the whole thing while nobody is using the machine, so
+// that we never keep it from going idle.
+void CheckHook() {
+    if (g_hHook != NULL) {
+        LASTINPUTINFO lastInput = {0};
+        lastInput.cbSize = sizeof(lastInput);
+        if (GetLastInputInfo(&lastInput)) {
+            if (lastInput.dwTime == g_lastCheckedInput) {
+                return;
+            }
+            g_lastCheckedInput = lastInput.dwTime;
+        }
+    }
+
+    HHOOK previous = g_hHook;
+    HHOOK fresh = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelHookProc, GetModuleHandle(NULL), 0);
+    if (fresh == NULL) {
+        PrintDebugString("Reinstalling the keyboard hook failed with error %lu", GetLastError());
+        return;
+    }
+
+    g_hHook = fresh;
+    if (previous != NULL) {
+        UnhookWindowsHookEx(previous);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Checks key state
 BOOL IsKeyPressed(int nVirtKey) {
-    return (GetKeyState(nVirtKey) & 0x80000000) > 0;
+    // GetAsyncKeyState, not GetKeyState: inside a low level hook we are after
+    // the physical state of the key, not the state our own message queue has
+    // caught up with.
+    return (GetAsyncKeyState(nVirtKey) & 0x8000) != 0;
 }
 
 BOOL g_lMenuKeyPressed = FALSE;
@@ -424,8 +929,35 @@ BOOL g_lShiftKeyPressed = FALSE;
 BOOL g_rMenuKeyPressed = FALSE;
 BOOL g_rShiftKeyPressed = FALSE;
 
+// Set when we swallowed a CapsLock key down, so that we know to swallow the
+// matching key up as well
+BOOL g_capsDownSwallowed = FALSE;
+
 ///////////////////////////////////////////////////////////////////////////////
-// A LowLevelHookProc implementation that captures the CapsLock key
+// Remembers that a key other than Alt and Shift went by while one of them was
+// held down, which is what tells an Alt-Shift layout switch apart from an
+// Alt-Shift-something shortcut
+static void MarkOtherKeyPressed() {
+    if (IsKeyPressed(VK_LMENU)) {
+        g_lMenuKeyPressed = TRUE;
+    }
+    if (IsKeyPressed(VK_LSHIFT)) {
+        g_lShiftKeyPressed = TRUE;
+    }
+    if (IsKeyPressed(VK_RMENU)) {
+        g_rMenuKeyPressed = TRUE;
+    }
+    if (IsKeyPressed(VK_RSHIFT)) {
+        g_rShiftKeyPressed = TRUE;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// A LowLevelHookProc implementation that captures the CapsLock key.
+//
+// Everything in here has to be quick: Windows gives a low level hook procedure
+// only LowLevelHooksTimeout milliseconds to return and silently removes the
+// hook when it is slower, so the work itself is posted to our own window.
 LRESULT CALLBACK LowLevelHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0) return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 
@@ -438,59 +970,55 @@ LRESULT CALLBACK LowLevelHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             switch (data->vkCode) {
             case VK_CAPITAL:
                 if (IsKeyPressed(VK_CONTROL)) {
-                    // Handle Ctrl-CapsLock - switch current layout and convert text in current field
-                    // We start SwitchLayoutAndConvertSelected in another thread since it simulates 
-                    // keystrokes to copy and paste the teset which call back into this hook.
-                    // That isn't good.
-                    _beginthread(SwitchAndConvert, 0, NULL);
+                    // Handle Ctrl-CapsLock - switch current layout and convert
+                    // the text in the current field
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_AND_CONVERT, 0, 0);
                 } else {
                     // Handle CapsLock - only switch current layout
-                    SwitchLayout();
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_LAYOUT, 0, 0);
                 }
+                g_capsDownSwallowed = TRUE;
                 return 1; // prevent windows from handling the keystroke
             default:
                 break;
             }
         } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            //PrintDebugString("WM_KEYUP vkCode %d lmenu %d lshift %d ctrl %d", data->vkCode, IsKeyPressed(VK_LMENU), IsKeyPressed(VK_LSHIFT), IsKeyPressed(VK_CONTROL));
             switch (data->vkCode) {
+            case VK_CAPITAL:
+                MarkOtherKeyPressed();
+                if (g_capsDownSwallowed) {
+                    // we swallowed the key down, so swallow the key up too -
+                    // otherwise applications see a release without a press
+                    g_capsDownSwallowed = FALSE;
+                    return 1;
+                }
+                break;
             case VK_LMENU:
                 if (!g_lMenuKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
-                    SwitchToLayoutNumber(0);
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 0, 0);
                 }
                 g_lMenuKeyPressed = FALSE;
                 break;
             case VK_LSHIFT:
                 if (!g_lShiftKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
-                    SwitchToLayoutNumber(0);
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 0, 0);
                 }
                 g_lShiftKeyPressed = FALSE;
                 break;
             case VK_RMENU:
                 if (!g_rMenuKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
-                    SwitchToLayoutNumber(1);
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 1, 0);
                 }
                 g_rMenuKeyPressed = FALSE;
                 break;
             case VK_RSHIFT:
                 if (!g_rShiftKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
-                    SwitchToLayoutNumber(1);
+                    PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 1, 0);
                 }
                 g_rShiftKeyPressed = FALSE;
                 break;
             default:
-                if (IsKeyPressed(VK_LMENU)) {
-                    g_lMenuKeyPressed = TRUE;
-                }
-                if (IsKeyPressed(VK_LSHIFT)) {
-                    g_lShiftKeyPressed = TRUE;
-                }
-                if (IsKeyPressed(VK_RMENU)) {
-                    g_rMenuKeyPressed = TRUE;
-                }
-                if (IsKeyPressed(VK_RSHIFT)) {
-                    g_rShiftKeyPressed = TRUE;
-                }
+                MarkOtherKeyPressed();
                 break;
             }
         }

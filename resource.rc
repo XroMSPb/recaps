@@ -1,72 +1,72 @@
-// Microsoft Visual C++ generated resource script.
-//
+// Recaps resource script.
+
 #include "resource.h"
+#include "version.h"
+#include "winres.h"
 
-#define APSTUDIO_READONLY_SYMBOLS
+#ifndef CREATEPROCESS_MANIFEST_RESOURCE_ID
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#endif
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+
 /////////////////////////////////////////////////////////////////////////////
-//
-// Generated from the TEXTINCLUDE 2 resource.
-//
-#include "afxres.h"
+// Neutral resources
 
-/////////////////////////////////////////////////////////////////////////////
-#undef APSTUDIO_READONLY_SYMBOLS
-
-/////////////////////////////////////////////////////////////////////////////
-// Hebrew resources
-
-#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_HEB)
-#ifdef _WIN32
-LANGUAGE LANG_HEBREW, SUBLANG_DEFAULT
-#pragma code_page(1255)
-#endif //_WIN32
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
 
 /////////////////////////////////////////////////////////////////////////////
 //
 // Icon
 //
 
-// Icon with lowest ID value placed first to ensure application icon
-// remains consistent on all systems.
 IDI_MAINFRAME           ICON                    "recaps.ico"
 
-#ifdef APSTUDIO_INVOKED
 /////////////////////////////////////////////////////////////////////////////
 //
-// TEXTINCLUDE
+// Side-by-side manifest: visual styles, DPI awareness, supported OS versions
+// and the asInvoker execution level. GenerateManifest is turned off in the
+// project file so that this is the only manifest in the binary.
 //
 
-1 TEXTINCLUDE 
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "recaps.manifest"
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Version
+//
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    RECAPS_VERSION_MAJOR,RECAPS_VERSION_MINOR,RECAPS_VERSION_PATCH,RECAPS_VERSION_BUILD
+ PRODUCTVERSION RECAPS_VERSION_MAJOR,RECAPS_VERSION_MINOR,RECAPS_VERSION_PATCH,RECAPS_VERSION_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
 BEGIN
-    "resource.h\0"
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "gooli.org"
+            VALUE "FileDescription",  "Recaps - change keyboard layout using the CapsLock key"
+            VALUE "FileVersion",      RECAPS_VERSION_STR
+            VALUE "InternalName",     "recaps"
+            VALUE "LegalCopyright",   "Copyright (C) 2007 Eli Golovinsky. Licensed under the GNU GPL v2 or later."
+            VALUE "OriginalFilename", "recaps.exe"
+            VALUE "ProductName",      "Recaps"
+            VALUE "ProductVersion",   RECAPS_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
 END
-
-2 TEXTINCLUDE 
-BEGIN
-    "#include ""afxres.h""\r\n"
-    "\0"
-END
-
-3 TEXTINCLUDE 
-BEGIN
-    "\r\n"
-    "\0"
-END
-
-#endif    // APSTUDIO_INVOKED
-
-#endif    // Hebrew resources
-/////////////////////////////////////////////////////////////////////////////
-
-
-
-#ifndef APSTUDIO_INVOKED
-/////////////////////////////////////////////////////////////////////////////
-//
-// Generated from the TEXTINCLUDE 3 resource.
-//
-
-
-/////////////////////////////////////////////////////////////////////////////
-#endif    // not APSTUDIO_INVOKED
-

@@ -8,8 +8,8 @@ void ShowError(const WCHAR* message)
 {
 	WCHAR buffer[BUFSIZE];
 
-	LPVOID errMessage;
-	FormatMessage( 
+	LPWSTR errMessage = NULL;
+	DWORD errMessageLength = FormatMessage( 
 		FORMAT_MESSAGE_ALLOCATE_BUFFER | 
 		FORMAT_MESSAGE_FROM_SYSTEM | 
 		FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -23,11 +23,19 @@ void ShowError(const WCHAR* message)
 
 	buffer[0] = '\0';
 	wcscat_s(buffer, BUFSIZE, message);
-	wcscat_s(buffer, BUFSIZE, L"\n\nError : ");
-	wcscat_s(buffer, BUFSIZE, (const WCHAR*)errMessage);
 
-	MessageBox(NULL, (const WCHAR*)buffer, L"Recaps Error", MB_OK | MB_ICONINFORMATION);
-	LocalFree(errMessage);
+	// FormatMessage leaves errMessage untouched when it fails, so only use
+	// what it gave us when it actually gave us something
+	if (errMessageLength != 0 && errMessage != NULL)
+	{
+		wcscat_s(buffer, BUFSIZE, L"\n\nError : ");
+		wcscat_s(buffer, BUFSIZE, errMessage);
+	}
+
+	MessageBox(NULL, buffer, L"Recaps Error", MB_OK | MB_ICONINFORMATION);
+
+	if (errMessage != NULL)
+		LocalFree(errMessage);
 }
 
 

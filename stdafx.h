@@ -18,6 +18,12 @@
 #include <stdio.h>
 
 #include <windows.h>
+
+// WIN32_LEAN_AND_MEAN keeps OLE out of windows.h, so the COM bits that the
+// Text Services Framework and UI Automation need are pulled in by hand
+#include <objbase.h>
+#include <msctf.h>
+#include <uiautomation.h>
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <process.h>
