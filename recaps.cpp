@@ -56,6 +56,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define APPWM_SWITCH_LAYOUT      (WM_APP + 2)
 #define APPWM_SWITCH_AND_CONVERT (WM_APP + 3)
 #define APPWM_SWITCH_TO_NUMBER   (WM_APP + 4)
+// posted by whichever thread asked for a switch, so that the timer that
+// checks on it is set by the thread that owns the window
+#define APPWM_VERIFY_SWITCH      (WM_APP + 5)
 
 //  Our commands
 #define ID_ABOUT             2000
@@ -86,6 +89,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 // How often we look at the active window to see which language it is using
 #define IDT_LAYOUT_POLL      2
+#define IDT_SWITCH_VERIFY    3
+#define SWITCH_VERIFY_DELAY  250
 #define LAYOUT_POLL_PERIOD   500
 #define THEME_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
 
@@ -131,6 +136,11 @@ HWINEVENTHOOK g_hWinEventHook = NULL;
 // The layout the tray icon is currently showing
 HKL g_shownLayout = NULL;
 
+// What the last switch asked for, so that we can tell afterwards whether the
+// window took any notice of it
+HKL g_switchFrom = NULL;
+HKL g_switchTo = NULL;
+
 // What GetLastInputInfo reported the last time the watchdog looked
 DWORD g_lastCheckedInput = 0;
 
@@ -150,6 +160,7 @@ HKL SwitchLayout();
 void SwitchToLayoutNumber(int number);
 void UpdateTrayIcon(BOOL force);
 void UpdateForegroundApp();
+void VerifySwitch();
 void StartSwitchAndConvert();
 BOOL InstallHook();
 void CheckHook();
@@ -487,6 +498,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     // Clean up
     KillTimer(g_hMessageWindow, IDT_HOOK_WATCHDOG);
     KillTimer(g_hMessageWindow, IDT_LAYOUT_POLL);
+    KillTimer(g_hMessageWindow, IDT_SWITCH_VERIFY);
     if (g_hWinEventHook != NULL) {
         UnhookWinEvent(g_hWinEventHook);
         g_hWinEventHook = NULL;
@@ -539,9 +551,20 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         SwitchToLayoutNumber((int)wParam);
         return 0;
 
+    // SetTimer wants the window to belong to the calling thread, and the
+    // conversion thread switches layouts too, so the timer is set here
+    case APPWM_VERIFY_SWITCH:
+        SetTimer(hWnd, IDT_SWITCH_VERIFY, SWITCH_VERIFY_DELAY, NULL);
+        return 0;
+
     case WM_TIMER:
         if (wParam == IDT_HOOK_WATCHDOG) {
             CheckHook();
+            return 0;
+        }
+        if (wParam == IDT_SWITCH_VERIFY) {
+            KillTimer(hWnd, IDT_SWITCH_VERIFY);
+            VerifySwitch();
             return 0;
         }
         if (wParam == IDT_LAYOUT_POLL) {
@@ -1005,14 +1028,27 @@ void UpdateTrayIcon(BOOL force) {
 // Windows 10 and 11 do by default: one input language for everything rather
 // than one per window.
 static BOOL ActivateLayoutViaTsf(HKL hkl) {
-    ITfInputProcessorProfileMgr* profileMgr = NULL;
+    ITfInputProcessorProfiles* profiles = NULL;
     HRESULT hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
-        IID_ITfInputProcessorProfileMgr, (void**)&profileMgr);
+        IID_ITfInputProcessorProfiles, (void**)&profiles);
+    if (FAILED(hr) || profiles == NULL) {
+        return FALSE;
+    }
+
+    ITfInputProcessorProfileMgr* profileMgr = NULL;
+    hr = profiles->QueryInterface(IID_ITfInputProcessorProfileMgr, (void**)&profileMgr);
     if (FAILED(hr) || profileMgr == NULL) {
+        profiles->Release();
         return FALSE;
     }
 
     LANGID language = LOWORD((ULONG_PTR)hkl);
+
+    // Move the input language first. ActivateProfile picks which layout a
+    // language uses; on its own it is documented to fail when the language
+    // asked for is not the current one, and the flag that stops it failing
+    // only marks the profile for later rather than switching now.
+    profiles->ChangeCurrentLanguage(language);
     hr = profileMgr->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT, language,
         CLSID_NULL, GUID_NULL, hkl, TF_IPPMF_FORSESSION);
     if (FAILED(hr)) {
@@ -1024,6 +1060,7 @@ static BOOL ActivateLayoutViaTsf(HKL hkl) {
             TF_IPPMF_FORSESSION | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE);
     }
     profileMgr->Release();
+    profiles->Release();
 
     if (FAILED(hr)) {
         PrintDebugString("ActivateProfile failed with 0x%08lX", hr);
@@ -1046,12 +1083,58 @@ HKL ChangeInputLanguage(UINT newLanguage) {
     // Ask through TSF first, which is what reaches modern applications, and
     // post the message as well for the windows that only understand that.
     // Both ask for the same layout, so asking twice costs nothing.
+    g_switchFrom = GetCurrentLayout();
+    g_switchTo = hkl;
     ActivateLayoutViaTsf(hkl);
     PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
+
+    // and look in a moment at whether any of that was listened to
+    PostMessage(g_hMessageWindow, APPWM_VERIFY_SWITCH, 0, 0);
 #ifdef _DEBUG
     PrintDebugString("Language set to %S", g_keyboardInfo.names[g_keyboardInfo.current]);
 #endif
     return hkl;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Looks at whether the layout we asked for actually took, and reaches for the
+// system shortcut when nothing moved at all.
+//
+// Some windows act on neither the message nor on what TSF was asked for - the
+// XAML windows the shell is built out of - and for those the shortcut Windows
+// handles itself is the only thing left to try.
+//
+// It does NOT rescue the Windows Security credential prompt, which is what
+// this was written for. That window was measured: it ignores the layout
+// change message, it ignores an injected Win+Space that works everywhere
+// else, and the keystrokes typed into it never reach a low level hook at all.
+// Input into a password prompt is protected, so nothing here can run for it.
+// This fallback is kept for the windows that are merely stubborn rather than
+// protected, and it has not been shown to rescue one of those either.
+//
+// The fallback only fires when the layout is still exactly the one we started
+// from, so a switch that did work is never disturbed, and it happens at most
+// once per keystroke.
+void VerifySwitch() {
+    HKL target = g_switchTo;
+    HKL source = g_switchFrom;
+    g_switchTo = NULL;
+    g_switchFrom = NULL;
+
+    if (target == NULL || source == NULL || target == source) {
+        return;
+    }
+    if (g_converting) {
+        return; // a conversion is busy sending keystrokes of its own
+    }
+
+    HKL current = GetCurrentLayout();
+    if (current == target || current != source) {
+        return; // it worked, or something else moved it in the meantime
+    }
+
+    PrintDebugString("The window ignored the layout change, using the system shortcut");
+    SendSystemLayoutShortcut();
 }
 
 ///////////////////////////////////////////////////////////////////////////////

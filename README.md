@@ -17,6 +17,20 @@ and leave a particular application alone - handy for a game that uses CapsLock f
 Also it improves language switching using Alt-Shift combination: LeftAlt-LeftShift will always switch to the first language installed,
 while RightAlt-RightShift will always switch to the second.
 
+Where it does not work
+------------------------------------
+
+Recaps cannot switch the layout in the Windows Security credential prompt - the window that asks for a user
+name and password when you connect to a network share. That window is protected against programmatic input,
+and the protection is thorough: it ignores the layout change message, it ignores an injected Win+Space that
+works in every other window, and the keys pressed in it never reach a low level keyboard hook at all, so
+Recaps is never even told about them. This is not something a program can work around, and it is the same for
+every tool of this kind. Switch the layout there by hand with Win+Space, or pick the layout you need before
+the prompt appears: it takes the system layout when it opens.
+
+The UAC prompt and the sign-in screen are out of reach for the same reason, only more so - they live on a
+separate desktop, where no program of yours is running at all.
+
 Enjoy!
 
 Eli Golovinsky

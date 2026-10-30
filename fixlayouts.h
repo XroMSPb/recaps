@@ -43,3 +43,6 @@ BOOL SetClipboardText(const WCHAR* text);
 // Functions that simulate key presses in the current window
 BOOL SendKey(BYTE vk, BOOL extended);
 BOOL SendKeyCombo(BYTE vkModifier, BYTE vk, BOOL extended);
+
+// Presses the shortcut Windows itself uses to move to the next layout
+BOOL SendSystemLayoutShortcut();

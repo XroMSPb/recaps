@@ -16,6 +16,14 @@
 #define COPY_ATTEMPTS 10
 #define COPY_WAIT     30
 
+// How long we wait for a selection we asked for with a keystroke to appear
+#define SELECTION_ATTEMPTS 5
+#define SELECTION_WAIT     40
+
+// How long the application gets to read the clipboard after we paste,
+// before the previous contents go back on it
+#define PASTE_WAIT 400
+
 // The window that owns the clipboard while we work with it
 static HWND g_clipboardWindow = NULL;
 
@@ -322,10 +330,14 @@ void FreeClipboardData(ClipboardData* formats)
 // back to the clipboard.
 //
 // Returns TRUE when it could find out. *ppText is then the selected text, or
-// NULL when nothing is selected; free it with free().
-static BOOL GetSelectedTextFromFocus(WCHAR** ppText)
+// NULL when nothing is selected; free it with free(). *pIsDocument, when
+// asked for, says whether what has the focus is a document rather than a
+// field, which decides what selecting everything would mean.
+static BOOL GetSelectedTextFromFocus(WCHAR** ppText, BOOL* pIsDocument)
 {
 	*ppText = NULL;
+	if (pIsDocument)
+		*pIsDocument = FALSE;
 
 	IUIAutomation* automation = NULL;
 	HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
@@ -337,6 +349,10 @@ static BOOL GetSelectedTextFromFocus(WCHAR** ppText)
 	IUIAutomationElement* focused = NULL;
 	if (SUCCEEDED(automation->GetFocusedElement(&focused)) && focused != NULL)
 	{
+		CONTROLTYPEID controlType = 0;
+		if (pIsDocument && SUCCEEDED(focused->get_CurrentControlType(&controlType)))
+			*pIsDocument = (controlType == UIA_DocumentControlTypeId);
+
 		IUIAutomationTextPattern* textPattern = NULL;
 		if (SUCCEEDED(focused->GetCurrentPatternAs(UIA_TextPatternId,
 				IID_IUIAutomationTextPattern, (void**)&textPattern)) && textPattern != NULL)
@@ -375,6 +391,27 @@ static BOOL GetSelectedTextFromFocus(WCHAR** ppText)
 
 	automation->Release();
 	return answered;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Waits for a selection we just asked for with a keystroke to appear.
+//
+// The keystroke has to travel to the other application and be acted upon
+// there, which takes a good deal longer than it takes us to ask the question
+// again, so asking once and believing the answer finds nothing selected.
+static WCHAR* WaitForSelection()
+{
+	for (int i = 0; i < SELECTION_ATTEMPTS; i++)
+	{
+		Sleep(SELECTION_WAIT);
+
+		WCHAR* text = NULL;
+		GetSelectedTextFromFocus(&text, NULL);
+		if (text)
+			return text;
+	}
+
+	return NULL;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -424,25 +461,35 @@ void ConvertSelectedTextInActiveWindow(HKL hklSource, HKL hklTarget)
 	}
 
 	WCHAR* sourceText = NULL;
+	BOOL isDocument = FALSE;
 
 	// Ask UI Automation first: it hands us the selected text without going
-	// near the clipboard, and it also tells us when nothing is selected,
-	// which is when the whole field has to be selected first.
-	BOOL selectionKnown = GetSelectedTextFromFocus(&sourceText);
+	// near the clipboard, and it also tells us when nothing is selected.
+	BOOL selectionKnown = GetSelectedTextFromFocus(&sourceText, &isDocument);
 	if (selectionKnown && sourceText == NULL)
 	{
-		SendKeyCombo(VK_CONTROL, 'A', FALSE);
-		Sleep(REMOTE_APP_WAIT);
-		GetSelectedTextFromFocus(&sourceText);
+		// Nothing is selected, so there is nothing to convert yet. In a field -
+		// a search box, an address bar - taking all of it is what the user
+		// means by fixing what they just typed. In a document that would take
+		// the entire text, so the line up to the caret is taken instead: a
+		// phrase of short words is one line, and taking only the word before
+		// the caret would leave the rest of it in the wrong layout.
+		if (isDocument)
+			SendKeyCombo(VK_SHIFT, VK_HOME, TRUE);
+		else
+			SendKeyCombo(VK_CONTROL, 'A', FALSE);
+
+		sourceText = WaitForSelection();
 	}
 
 	if (sourceText == NULL)
 	{
 		// the application does not tell us, so go through the clipboard
 		sourceText = CopySelectedText(dummy);
-		if (!sourceText)
+		if (!sourceText && !isDocument)
 		{
-			// nothing was selected: select the whole field and try again
+			// nothing was selected: select the whole field and try again. Never
+			// in a document, where that would mean the whole text.
 			SendKeyCombo(VK_CONTROL, 'A', FALSE);
 			sourceText = CopySelectedText(dummy);
 		}
@@ -468,9 +515,12 @@ void ConvertSelectedTextInActiveWindow(HKL hklSource, HKL hklTarget)
 				// simulate Ctrl-V to paste the text, replacing the previous text
 				SendKeyCombo(VK_CONTROL, 'V', FALSE);
 
-				// let the application complete pasting before putting the old
-				// data back on the clipboard
-				Sleep(REMOTE_APP_WAIT);
+				// Give the application time to actually read the clipboard before
+				// the previous contents go back on it. It reads it when it gets
+				// round to handling the keystroke rather than when we send it, and
+				// putting the old contents back too early is what makes the wrong
+				// text land in the document.
+				Sleep(PASTE_WAIT);
 			}
 
 			free(targetText);
@@ -544,16 +594,23 @@ WCHAR LayoutConvertChar(WCHAR ch, HKL hklSource, HKL hklTarget)
 size_t LayoutConvertString(const WCHAR* str, WCHAR* buffer, size_t size, HKL hklSource, HKL hklTarget)
 {
 	size_t i;
+	size_t changed = 0;
 	size_t length = wcslen(str);
 	for (i = 0; i < length && i < size-1; i++)
 	{
+		// A character the source layout cannot produce - a line break, a dash
+		// pasted in from somewhere, an emoji - is kept as it is. Abandoning
+		// the whole string over one of them is why converting a paragraph in
+		// a document did nothing at all.
 		WCHAR ch = LayoutConvertChar(str[i], hklSource, hklTarget);
-		if (ch == 0)
-			return 0;
-		buffer[i] = ch;
+		buffer[i] = ch ? ch : str[i];
+		if (ch != 0 && ch != str[i])
+			changed++;
 	}
 	buffer[i] = '\0';
-	return i;
+
+	// nothing came out any different, so there is nothing worth pasting
+	return changed ? i : 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -647,4 +704,26 @@ BOOL SendKeyCombo(BYTE vkModifier, BYTE vk, BOOL extended)
 		FillKeyInput(&inputs[count++], vkModifier, FALSE, TRUE);
 
 	return SendInput(count, inputs, sizeof(INPUT)) == count;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Presses Win+Space, the shortcut Windows acts on by itself.
+//
+// It is the last resort for windows that answer neither the layout change
+// message nor the request made through TSF. Because the system is what acts
+// on it, it reaches a little further than talking to the window does. What it
+// cannot do is pick a particular layout: it only moves on to the next one,
+// which is the same thing when two are installed.
+//
+// It does not reach a protected window such as the Windows Security credential
+// prompt: injected input is dropped there. See VerifySwitch in recaps.cpp.
+BOOL SendSystemLayoutShortcut()
+{
+	INPUT inputs[4];
+	FillKeyInput(&inputs[0], VK_LWIN, TRUE, FALSE);
+	FillKeyInput(&inputs[1], VK_SPACE, FALSE, FALSE);
+	FillKeyInput(&inputs[2], VK_SPACE, FALSE, TRUE);
+	FillKeyInput(&inputs[3], VK_LWIN, TRUE, TRUE);
+
+	return SendInput(4, inputs, sizeof(INPUT)) == 4;
 }
