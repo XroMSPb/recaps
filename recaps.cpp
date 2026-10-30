@@ -60,7 +60,19 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 //  Our commands
 #define ID_ABOUT             2000
 #define ID_EXIT              2001
-#define ID_LANG              2002
+#define ID_AUTOSTART         2002
+#define ID_PAUSE             2003
+#define ID_IGNORE_APP        2004
+// one command per installed language, so they start clear of the rest
+#define ID_LANG              2100
+
+// Where Windows keeps the programs that start with it, and where we keep
+// the applications to stay away from
+#define RUN_KEY     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VALUE   L"Recaps"
+#define IGNORED_KEY L"Software\\Recaps\\Ignored"
+#define MAX_IGNORED 64
+#define PATH_SEPARATOR L'\\'
 
 // General constants
 #define MAXLEN 1024
@@ -104,6 +116,18 @@ UINT g_uTaskbarCreated = 0;
 // the clipboard.
 volatile LONG g_converting = 0;
 
+// The applications Recaps leaves alone, the executable owning the foreground
+// window, and whether that window is one of them. The hook reads the flag.
+WCHAR g_ignored[MAX_IGNORED][MAX_PATH] = {0};
+UINT g_ignoredCount = 0;
+WCHAR g_foregroundApp[MAX_PATH] = L"";
+WCHAR g_menuApp[MAX_PATH] = L"";
+volatile LONG g_ignoreActive = 0;
+
+// Set while Recaps is paused and the hook is deliberately not installed
+BOOL g_paused = FALSE;
+HWINEVENTHOOK g_hWinEventHook = NULL;
+
 // The layout the tray icon is currently showing
 HKL g_shownLayout = NULL;
 
@@ -125,6 +149,7 @@ HWND RemoteGetFocus();
 HKL SwitchLayout();
 void SwitchToLayoutNumber(int number);
 void UpdateTrayIcon(BOOL force);
+void UpdateForegroundApp();
 void StartSwitchAndConvert();
 BOOL InstallHook();
 void CheckHook();
@@ -156,6 +181,217 @@ static BOOL GetRunningInstancePath(WCHAR* path, DWORD size) {
     BOOL result = QueryFullProcessImageName(process, 0, path, &size);
     CloseHandle(process);
     return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Whether Recaps starts with Windows.
+//
+// This is a value under the Run key rather than a shortcut in the Startup
+// folder: the Startup page of the Settings app lists what is under Run, so the
+// user finds us where they look for it, and no administrator rights are needed
+// for it either.
+static BOOL IsAutostartEnabled() {
+    HKEY hkey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    BOOL enabled = RegQueryValueEx(hkey, RUN_VALUE, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+    RegCloseKey(hkey);
+    return enabled;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Turns starting with Windows on or off
+static void SetAutostart(BOOL enable) {
+    HKEY hkey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &hkey) != ERROR_SUCCESS) {
+        return;
+    }
+
+    if (enable) {
+        WCHAR path[MAX_PATH];
+        WCHAR quoted[MAX_PATH + 4];
+        if (GetModuleFileName(NULL, path, _countof(path)) > 0 &&
+            swprintf_s(quoted, _countof(quoted), L"\"%s\"", path) > 0) {
+            RegSetValueEx(hkey, RUN_VALUE, 0, REG_SZ, (const BYTE*)quoted,
+                (DWORD)((wcslen(quoted) + 1) * sizeof(WCHAR)));
+        }
+    } else {
+        RegDeleteValue(hkey, RUN_VALUE);
+    }
+
+    RegCloseKey(hkey);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Reads the applications Recaps is to keep its hands off. They are stored one
+// registry value per executable name, which makes adding and removing one a
+// single call and needs no parsing.
+static void LoadIgnoredApps() {
+    g_ignoredCount = 0;
+
+    HKEY hkey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, IGNORED_KEY, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+        return;
+    }
+
+    for (DWORD index = 0; g_ignoredCount < MAX_IGNORED; index++) {
+        DWORD length = _countof(g_ignored[g_ignoredCount]);
+        if (RegEnumValue(hkey, index, g_ignored[g_ignoredCount], &length,
+                NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            break;
+        }
+        if (g_ignored[g_ignoredCount][0] != L'\0') {
+            g_ignoredCount++;
+        }
+    }
+
+    RegCloseKey(hkey);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Tells whether `app`, an executable name, is one of those we leave alone
+static BOOL IsAppIgnored(const WCHAR* app) {
+    for (UINT i = 0; i < g_ignoredCount; i++) {
+        if (_wcsicmp(g_ignored[i], app) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Adds `app` to the list or takes it off again, and saves it
+static void ToggleIgnoredApp(const WCHAR* app) {
+    HKEY hkey;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, IGNORED_KEY, 0, NULL, 0,
+            KEY_WRITE, NULL, &hkey, NULL) != ERROR_SUCCESS) {
+        return;
+    }
+
+    if (IsAppIgnored(app)) {
+        RegDeleteValue(hkey, app);
+    } else {
+        DWORD one = 1;
+        RegSetValueEx(hkey, app, 0, REG_DWORD, (const BYTE*)(&one), sizeof(one));
+    }
+
+    RegCloseKey(hkey);
+    LoadIgnoredApps();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Tells whether a window is part of the shell itself - the taskbar, a second
+// taskbar on another monitor, or the flyout that holds the hidden notification
+// icons.
+//
+// Clicking our icon brings one of those to the front. That is the user
+// reaching for our menu, not a change of what they were working in, so it must
+// not count as the application the menu offers to ignore. A window belonging
+// to explorer.exe that is NOT one of these is a real folder window, and
+// ignoring that one is a perfectly reasonable thing to ask for.
+static BOOL IsShellWindow(HWND hwnd) {
+    static const WCHAR* shellClasses[] = {
+        L"Shell_TrayWnd",
+        L"Shell_SecondaryTrayWnd",
+        L"NotifyIconOverflowWindow",
+        L"TopLevelWindowForOverflowXamlIsland",
+        L"Xaml_WindowedPopupClass",
+    };
+
+    WCHAR className[64];
+    if (GetClassName(hwnd, className, _countof(className)) == 0) {
+        return FALSE;
+    }
+
+    for (int i = 0; i < _countof(shellClasses); i++) {
+        if (_wcsicmp(className, shellClasses[i]) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Works out which application owns the foreground window and whether we are
+// meant to leave it alone.
+//
+// The hook procedure only reads the answer: opening a process to ask for its
+// name takes far longer than a low level hook is allowed to spend. When we
+// cannot tell - while our own menu is up, for one - the previous answer
+// stands, which is also what lets the menu offer the application the user was
+// just working in.
+void UpdateForegroundApp() {
+    WCHAR path[MAX_PATH] = L"";
+
+    HWND foreground = GetForegroundWindow();
+    DWORD processId = 0;
+    if (foreground != NULL) {
+        GetWindowThreadProcessId(foreground, &processId);
+    }
+
+    if (processId != 0 && processId != GetCurrentProcessId()) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+        if (process != NULL) {
+            DWORD size = _countof(path);
+            if (!QueryFullProcessImageName(process, 0, path, &size)) {
+                path[0] = L'\0';
+            }
+            CloseHandle(process);
+        }
+    }
+
+    if (path[0] != L'\0') {
+        const WCHAR* name = wcsrchr(path, PATH_SEPARATOR);
+        wcscpy_s(g_foregroundApp, _countof(g_foregroundApp), name ? name + 1 : path);
+
+        // the menu offers the last application that was not the shell
+        if (!IsShellWindow(foreground)) {
+            wcscpy_s(g_menuApp, _countof(g_menuApp), g_foregroundApp);
+        }
+    }
+
+    InterlockedExchange(&g_ignoreActive,
+        (g_foregroundApp[0] != L'\0' && IsAppIgnored(g_foregroundApp)) ? 1 : 0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Called by Windows when a different window comes to the front. Without it we
+// would only notice on the next tick of the timer, and a CapsLock pressed in
+// the first moments after switching to an ignored application would still be
+// swallowed.
+static void CALLBACK ForegroundChanged(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+        LONG idObject, LONG idChild, DWORD threadId, DWORD time) {
+    UNREFERENCED_PARAMETER(hook);
+    UNREFERENCED_PARAMETER(event);
+    UNREFERENCED_PARAMETER(hwnd);
+    UNREFERENCED_PARAMETER(idObject);
+    UNREFERENCED_PARAMETER(idChild);
+    UNREFERENCED_PARAMETER(threadId);
+    UNREFERENCED_PARAMETER(time);
+
+    UpdateForegroundApp();
+    UpdateTrayIcon(FALSE);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Stops and starts Recaps without quitting it, for the times when CapsLock has
+// to be CapsLock: a game that binds it, or an application whose own shortcut
+// it gets in the way of.
+static void SetPaused(BOOL paused) {
+    g_paused = paused;
+
+    if (paused) {
+        if (g_hHook != NULL) {
+            UnhookWindowsHookEx(g_hHook);
+            g_hHook = NULL;
+        }
+    } else {
+        InstallHook();
+    }
+
+    UpdateTrayIcon(TRUE);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -221,7 +457,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     SetClipboardWindow(g_hMessageWindow);
     AddTrayIcon(g_hMessageWindow, ID_TRAYICON, APPWM_TRAYICON, IDI_MAINFRAME, TITLE);
     RefreshKeyboardLayouts(&g_keyboardInfo);
+    LoadIgnoredApps();
+    UpdateForegroundApp();
     UpdateTrayIcon(TRUE);
+
+    // Notice straight away when another application comes to the front, so
+    // that the ignore list takes effect on the very first keystroke in it
+    g_hWinEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, ForegroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     // Set hook to capture CapsLock
     if (!InstallHook()) {
@@ -244,6 +487,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     // Clean up
     KillTimer(g_hMessageWindow, IDT_HOOK_WATCHDOG);
     KillTimer(g_hMessageWindow, IDT_LAYOUT_POLL);
+    if (g_hWinEventHook != NULL) {
+        UnhookWinEvent(g_hWinEventHook);
+        g_hWinEventHook = NULL;
+    }
     if (g_hHook != NULL) {
         UnhookWindowsHookEx(g_hHook);
         g_hHook = NULL;
@@ -298,6 +545,9 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (wParam == IDT_LAYOUT_POLL) {
+            // the event hook above is the quick way; this is the backstop,
+            // and it is also what notices a layout changed with Win+Space
+            UpdateForegroundApp();
             UpdateTrayIcon(FALSE);
             return 0;
         }
@@ -353,6 +603,15 @@ int OnCommand(HWND hWnd, WORD wID, HWND hCtl) {
         PostMessage( hWnd, WM_CLOSE, 0, 0 );
     } else if (wID == ID_ABOUT) {
         MessageBox(NULL, HELP_MESSAGE, HELP_TITLE, MB_OK | MB_ICONINFORMATION);
+    } else if (wID == ID_PAUSE) {
+        SetPaused(!g_paused);
+    } else if (wID == ID_AUTOSTART) {
+        SetAutostart(!IsAutostartEnabled());
+    } else if (wID == ID_IGNORE_APP) {
+        if (g_menuApp[0] != L'\0') {
+            ToggleIgnoredApp(g_menuApp);
+            UpdateForegroundApp();
+        }
     } else {
         for (UINT i = 0; i < g_keyboardInfo.count; i++) {
             if (g_keyboardInfo.menuIds[i] == wID) {
@@ -376,6 +635,23 @@ BOOL ShowPopupMenu(HWND hWnd) {
     // Create the menu
     HMENU hPop = CreatePopupMenu();
     InsertMenu(hPop, i++, MF_BYPOSITION | MF_STRING, ID_ABOUT, L"About");
+    InsertMenu(hPop, i++, MF_SEPARATOR, 0, NULL);
+
+    InsertMenu(hPop, i++, MF_BYPOSITION | MF_STRING | (g_paused ? MF_CHECKED : 0),
+        ID_PAUSE, L"Paused");
+    InsertMenu(hPop, i++, MF_BYPOSITION | MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0),
+        ID_AUTOSTART, L"Start with Windows");
+
+    // An entry for whichever application was in front when the menu opened,
+    // so that keeping Recaps out of it is one click and needs no dialog and
+    // no typing of executable names.
+    if (g_menuApp[0] != L'\0') {
+        WCHAR caption[MAX_PATH + 32];
+        _snwprintf_s(caption, _countof(caption), _TRUNCATE, L"Ignore %s", g_menuApp);
+        InsertMenu(hPop, i++, MF_BYPOSITION | MF_STRING | (IsAppIgnored(g_menuApp) ? MF_CHECKED : 0),
+            ID_IGNORE_APP, caption);
+    }
+
     InsertMenu(hPop, i++, MF_SEPARATOR, 0, NULL);
 
     // Add items for the languages
@@ -707,13 +983,15 @@ void UpdateTrayIcon(BOOL force) {
             break;
         }
     }
-    if (name != NULL) {
-        _snwprintf_s(tooltip, _countof(tooltip), _TRUNCATE, L"Recaps - %s", name);
-    } else {
-        wcscpy_s(tooltip, _countof(tooltip), TITLE);
-    }
+    _snwprintf_s(tooltip, _countof(tooltip), _TRUNCATE, L"Recaps%s%s%s",
+        name != NULL ? L" - " : L"",
+        name != NULL ? name : L"",
+        g_paused ? L" (paused)" : L"");
 
-    SetTrayIconText(g_hMessageWindow, ID_TRAYICON, abbreviation, GetTrayTextColor(), tooltip);
+    // grey while paused, so that the icon says at a glance that CapsLock is
+    // CapsLock again
+    COLORREF color = g_paused ? RGB(128, 128, 128) : GetTrayTextColor();
+    SetTrayIconText(g_hMessageWindow, ID_TRAYICON, abbreviation, color, tooltip);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -891,6 +1169,10 @@ BOOL InstallHook() {
 // is removed. We skip the whole thing while nobody is using the machine, so
 // that we never keep it from going idle.
 void CheckHook() {
+    if (g_paused) {
+        return; // the hook is meant to be gone
+    }
+
     if (g_hHook != NULL) {
         LASTINPUTINFO lastInput = {0};
         lastInput.cbSize = sizeof(lastInput);
@@ -969,6 +1251,11 @@ LRESULT CALLBACK LowLevelHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (wParam == WM_KEYDOWN) {
             switch (data->vkCode) {
             case VK_CAPITAL:
+                if (g_ignoreActive) {
+                    // this application is on the ignore list, so CapsLock
+                    // is simply CapsLock here
+                    break;
+                }
                 if (IsKeyPressed(VK_CONTROL)) {
                     // Handle Ctrl-CapsLock - switch current layout and convert
                     // the text in the current field
@@ -994,25 +1281,25 @@ LRESULT CALLBACK LowLevelHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 }
                 break;
             case VK_LMENU:
-                if (!g_lMenuKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
+                if (!g_ignoreActive && !g_lMenuKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
                     PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 0, 0);
                 }
                 g_lMenuKeyPressed = FALSE;
                 break;
             case VK_LSHIFT:
-                if (!g_lShiftKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
+                if (!g_ignoreActive && !g_lShiftKeyPressed && IsKeyPressed(VK_LMENU) && IsKeyPressed(VK_LSHIFT) && !IsKeyPressed(VK_CONTROL)) {
                     PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 0, 0);
                 }
                 g_lShiftKeyPressed = FALSE;
                 break;
             case VK_RMENU:
-                if (!g_rMenuKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
+                if (!g_ignoreActive && !g_rMenuKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
                     PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 1, 0);
                 }
                 g_rMenuKeyPressed = FALSE;
                 break;
             case VK_RSHIFT:
-                if (!g_rShiftKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
+                if (!g_ignoreActive && !g_rShiftKeyPressed && IsKeyPressed(VK_RMENU) && IsKeyPressed(VK_RSHIFT) && !IsKeyPressed(VK_CONTROL)) {
                     PostMessage(g_hMessageWindow, APPWM_SWITCH_TO_NUMBER, 1, 0);
                 }
                 g_rShiftKeyPressed = FALSE;

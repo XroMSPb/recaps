@@ -11,6 +11,9 @@ If you have more than two languages installed, you can select the ones you want 
 
 The tray icon shows the language the active window is using, so you can tell at a glance what typing will produce.
 
+The menu on that icon also lets you pause Recaps when CapsLock has to be CapsLock for a while, start it with Windows,
+and leave a particular application alone - handy for a game that uses CapsLock for something of its own.
+
 Also it improves language switching using Alt-Shift combination: LeftAlt-LeftShift will always switch to the first language installed,
 while RightAlt-RightShift will always switch to the second.
 
@@ -35,6 +38,8 @@ Revision history
 	Builds for 64-bit Windows, remembers its settings per
 	keyboard layout instead of per language name, and keeps
 	its own temporary data out of the clipboard history.
+	The menu can pause Recaps, start it with Windows and
+	keep it out of applications you name.
 
 0.8 Added conversion of currently selected text.
 
