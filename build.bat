@@ -2,7 +2,7 @@
 setlocal
 
 :: Keep VERSION in sync with version.h and with AppVersion in setup.iss
-set VERSION=0.8
+set VERSION=0.9
 set CONFIG=Release
 set PLATFORMS=Win32 x64
 

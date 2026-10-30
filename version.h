@@ -6,11 +6,11 @@
 // and with AppVersion in setup.iss.
 
 #define RECAPS_VERSION_MAJOR    0
-#define RECAPS_VERSION_MINOR    8
+#define RECAPS_VERSION_MINOR    9
 #define RECAPS_VERSION_PATCH    0
 #define RECAPS_VERSION_BUILD    0
 
-#define RECAPS_VERSION_STR      "0.8.0.0"
-#define RECAPS_VERSION_STRW     L"0.8"
+#define RECAPS_VERSION_STR      "0.9.0.0"
+#define RECAPS_VERSION_STRW     L"0.9"
 
 #endif // RECAPS_VERSION_H

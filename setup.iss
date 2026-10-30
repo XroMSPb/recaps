@@ -1,9 +1,9 @@
 ; Inno Setup 6 script for Recaps.
-; Build it with:  iscc /DMyAppVersion=0.8 /F"recaps-0.8-setup" setup.iss
+; Build it with:  iscc /DMyAppVersion=0.9 /F"recaps-0.9-setup" setup.iss
 ; (build.bat does this for you)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.8"
+  #define MyAppVersion "0.9"
 #endif
 #define MyAppName "Recaps"
 #define MyAppPublisher "gooli.org"

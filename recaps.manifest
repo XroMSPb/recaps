@@ -5,7 +5,7 @@
 
   <assemblyIdentity type="win32"
                     name="gooli.org.Recaps"
-                    version="0.8.0.0"
+                    version="0.9.0.0"
                     processorArchitecture="*" />
 
   <description>Recaps - change language and keyboard layout using the CapsLock key.</description>

@@ -9,6 +9,8 @@ If you accidentally typed some text in the wrong layout, Ctrl-CapsLock should fi
 
 If you have more than two languages installed, you can select the ones you want to cycle through if you right click the application's icon.
 
+The tray icon shows the language the active window is using, so you can tell at a glance what typing will produce.
+
 Also it improves language switching using Alt-Shift combination: LeftAlt-LeftShift will always switch to the first language installed,
 while RightAlt-RightShift will always switch to the second.
 
@@ -20,6 +22,20 @@ http://www.gooli.org/
 
 Revision history
 ------------------------------------
+0.9	Brought up to date for Windows 10 and 11.
+	The tray icon now shows the current language.
+	The layout is also switched through the Text Services
+	Framework, so it changes in Store and WinUI applications
+	as well, and the selected text is found through UI
+	Automation rather than guessed at.
+	Fixed the keyboard hook being dropped by Windows, the
+	tray icon disappearing when Explorer restarts, and
+	several ways the clipboard could be left holding the
+	wrong thing.
+	Builds for 64-bit Windows, remembers its settings per
+	keyboard layout instead of per language name, and keeps
+	its own temporary data out of the clipboard history.
+
 0.8 Added conversion of currently selected text.
 
 0.7 Added LeftAlt-LeftShift and RightAlt-RightShift combinations.
